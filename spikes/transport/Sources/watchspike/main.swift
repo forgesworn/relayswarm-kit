@@ -1,156 +1,84 @@
-import CRTC
 import Foundation
 import RelaySwarmSignalling
+import RelaySwarmTransport
 
-// The remote watch, end to end: this process is the telescope's Mac. It
-// announces a session over public Nostr relays, answers a browser viewer's
-// encrypted offer, opens a WebRTC data channel through libdatachannel, and
-// streams guest-page feed frames down it. Success is three acknowledged
-// frames rendered by a real browser.
+// The remote watch, end to end, through the shipping product code: SwarmHost
+// announces over public relays, answers the browser's encrypted offer, and
+// broadcasts feed frames. Success is three acknowledged frames rendered by
+// a real browser. Compare the first run of the hand-rolled version (49.9s,
+// most of it a 15s announce cadence): the watcher-presence handshake should
+// make discovery a round trip.
 
 let swarmID = CommandLine.arguments.count > 1
     ? CommandLine.arguments[1]
     : "earendel-watch-\(UInt32.random(in: 0..<UInt32.max))"
 
-final class OriginBox: @unchecked Sendable {
-    let lock = NSLock()
-    var peer: Int32 = -1
-    var channel: Int32 = -1
-    var answer: CheckedContinuation<String, Never>?
-    var finished: CheckedContinuation<Int, Never>?
-    var frames = 0
-    var acks = 0
+// A 1x1 JPEG, enough to prove the inline preview path renders.
+let tinyPreview = "/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAAEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEB"
+    + "AQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQEBAQH/wAALCAABAAEBAREA/8QAFAABAAAAAAAA"
+    + "AAAAAAAAAAAACf/EABQQAQAAAAAAAAAAAAAAAAAAAAD/2gAIAQEAAD8AVN//2Q=="
 
-    func withLock<T>(_ body: (OriginBox) -> T) -> T {
-        lock.lock(); defer { lock.unlock() }
-        return body(self)
-    }
-}
-let box = OriginBox()
-let boxPointer = Unmanaged.passRetained(box).toOpaque()
-
-func feedFrame(_ n: Int) -> String {
+func frame(_ n: Int) -> String {
     let done = 140 + n * 3
-    return #"{"previewSeq":0,"snapshot":{"headline":"Capturing M31","warning":null,"rows":["#
+    let snapshot = #"{"headline":"Capturing M31","warning":null,"rows":["#
         + #"{"label":"Frames","value":"\#(done) of 300"},"#
-        + #"{"label":"Battery","value":"78%"},"#
-        + #"{"label":"Minutes of light","value":"\#(47 + n)"}],"finished":false}}"#
+        + #"{"label":"Battery","value":"78%"}],"finished":false}"#
+    return #"{"previewSeq":\#(n),"snapshot":\#(snapshot),"preview":"\#(tinyPreview)"}"#
 }
 
-func startFeed() {
-    let timer = DispatchSource.makeTimerSource()
-    timer.schedule(deadline: .now(), repeating: 2.0)
-    timer.setEventHandler {
-        let (channel, n) = box.withLock { ($0.channel, $0.frames) }
-        guard channel >= 0 else { return }
-        box.withLock { $0.frames += 1 }
-        rtcSendMessage(channel, feedFrame(n), -1)
-    }
-    timer.activate()
-    _ = Unmanaged.passRetained(timer as AnyObject)
-}
-
-func acceptOffer(_ sdp: String) async -> String {
-    var stunServer: UnsafePointer<CChar>? = UnsafePointer(strdup("stun:stun.l.google.com:19302"))
-    var config = rtcConfiguration()
-    memset(&config, 0, MemoryLayout<rtcConfiguration>.size)
-    let peer = withUnsafeMutablePointer(to: &stunServer) { servers -> Int32 in
-        config.iceServers = servers
-        config.iceServersCount = 1
-        return rtcCreatePeerConnection(&config)
-    }
-    box.withLock { $0.peer = peer }
-    rtcSetUserPointer(peer, boxPointer)
-
-    rtcSetDataChannelCallback(peer) { _, channel, pointer in
-        guard let pointer else { return }
-        let box = Unmanaged<OriginBox>.fromOpaque(pointer).takeUnretainedValue()
-        box.withLock { $0.channel = channel }
-        rtcSetUserPointer(channel, pointer)
-        rtcSetOpenCallback(channel) { _, _ in
-            print("origin: data channel open, feeding")
-            startFeed()
-        }
-        rtcSetMessageCallback(channel) { _, message, size, pointer in
-            guard let message, let pointer, size < 0 else { return }
-            let box = Unmanaged<OriginBox>.fromOpaque(pointer).takeUnretainedValue()
-            let text = String(cString: message)
-            guard text.contains("\"ack\"") else { return }
-            let done = box.withLock { held -> CheckedContinuation<Int, Never>? in
-                held.acks += 1
-                guard held.acks >= 3, let finished = held.finished else { return nil }
-                held.finished = nil
-                return finished
-            }
-            done?.resume(returning: box.withLock { $0.acks })
+actor Finish {
+    var acks = 0
+    var waiter: CheckedContinuation<Void, Never>?
+    func ack() {
+        acks += 1
+        if acks >= 3, let waiter {
+            self.waiter = nil
+            waiter.resume()
         }
     }
-    rtcSetGatheringStateChangeCallback(peer) { peer, state, pointer in
-        guard state == RTC_GATHERING_COMPLETE, let pointer else { return }
-        let box = Unmanaged<OriginBox>.fromOpaque(pointer).takeUnretainedValue()
-        var buffer = [CChar](repeating: 0, count: 65_536)
-        guard rtcGetLocalDescription(peer, &buffer, Int32(buffer.count)) >= 0 else { return }
-        let sdp = String(cString: buffer)
-        box.withLock { held -> CheckedContinuation<String, Never>? in
-            let waiting = held.answer
-            held.answer = nil
-            return waiting
-        }?.resume(returning: sdp)
-    }
-
-    return await withCheckedContinuation { continuation in
-        box.withLock { $0.answer = continuation }
-        rtcSetRemoteDescription(peer, sdp, "offer")
+    func wait() async {
+        await withCheckedContinuation { waiter = $0 }
     }
 }
 
-rtcInitLogger(RTC_LOG_ERROR, nil)
-
-let keys = NostrKeys.generate()
+let finish = Finish()
 let relays = ["wss://relay.damus.io", "wss://nos.lol", "wss://relay.primal.net"]
     .compactMap(URL.init(string:))
-let pool = RelayPool(connections: relays.map {
-    RelayConnection(transport: WebSocketRelayTransport(url: $0))
-})
-try await pool.connect()
-let signaller = SwarmSignaller(keys: keys, pool: pool, swarmID: swarmID)
-let signals = await signaller.signals()
+let host = SwarmHost(relays: relays, swarmID: swarmID)
+await host.setGuestMessageHandler { text in
+    guard text.contains("\"ack\"") else { return }
+    Task { await finish.ack() }
+}
+try await host.start()
 print("origin: announcing swarm \(swarmID)")
+let started = Date()
 
-let announcing = Task {
+let feeding = Task {
+    var n = 0
     while !Task.isCancelled {
-        try? await signaller.announcePresence(role: "origin")
-        try? await Task.sleep(for: .seconds(15))
+        n += 1
+        await host.broadcast(frame(n))
+        try? await Task.sleep(for: .seconds(2))
     }
 }
 
-let started = Date()
-let outcome: Int? = await withTaskGroup(of: Int?.self) { group in
-    group.addTask {
-        for await signal in signals where signal.type == "offer" {
-            guard let sdp = signal.sdp else { continue }
-            print("origin: offer received from \(signal.from.prefix(12)), answering")
-            let answer = await acceptOffer(sdp)
-            try? await signaller.send(type: "answer", sdp: answer, to: signal.from)
-            return await withCheckedContinuation { continuation in
-                box.withLock { $0.finished = continuation }
-            }
-        }
-        return nil
-    }
+let outcome = await withTaskGroup(of: Bool.self) { group in
+    group.addTask { await finish.wait(); return true }
     group.addTask {
         try? await Task.sleep(for: .seconds(180))
-        return nil
+        return false
     }
-    let first = await group.next() ?? nil
+    let first = await group.next() ?? false
     group.cancelAll()
     return first
 }
+feeding.cancel()
+await host.stop()
 
-announcing.cancel()
-if let acks = outcome {
+if outcome {
     let elapsed = String(format: "%.1f", -started.timeIntervalSinceNow)
-    print("SUCCESS: browser rendered and acknowledged \(acks) feed frames in \(elapsed)s")
+    let watched = await finish.acks
+    print("SUCCESS: browser rendered and acknowledged \(watched) frames in \(elapsed)s through SwarmHost")
     exit(0)
 } else {
     print("FAIL: no viewer completed within the window")

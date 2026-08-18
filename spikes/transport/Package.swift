@@ -29,12 +29,13 @@ let package = Package(
     targets: [
         .target(name: "CRTC"),
         .executableTarget(name: "dcspike", dependencies: ["CRTC"], linkerSettings: link),
+        // watchspike rides the shipping transport product, prebuilt libs
+        // included - it needs no local libdatachannel build at all.
         .executableTarget(
             name: "watchspike",
             dependencies: [
-                "CRTC",
                 .product(name: "RelaySwarmSignalling", package: "relayswarmkit"),
-            ],
-            linkerSettings: link),
+                .product(name: "RelaySwarmTransport", package: "relayswarmkit"),
+            ]),
     ]
 )

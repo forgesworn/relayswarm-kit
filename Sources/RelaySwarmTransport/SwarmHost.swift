@@ -16,6 +16,7 @@ public actor SwarmHost {
     private var channels = [ObjectIdentifier: DataChannel]()
     private var tasks = [Task<Void, Never>]()
     private var lastAnnounce = Date.distantPast
+    private var guestText: (@Sendable (String) -> Void)?
 
     public init(keys: NostrKeys = .generate(), relays: [URL], swarmID: String,
                 stunServers: [String] = ["stun:stun.l.google.com:19302"]) {
@@ -74,6 +75,13 @@ public actor SwarmHost {
     /// Open viewer channels right now.
     public var guestCount: Int { channels.count }
 
+    /// Hear what viewers send back - acknowledgements, requests, whatever
+    /// the application layers on the channel.
+    public func setGuestMessageHandler(_ handler: @Sendable @escaping (String) -> Void) {
+        guestText = handler
+        for channel in channels.values { channel.onText = handler }
+    }
+
     /// Send one text frame to every open channel.
     public func broadcast(_ text: String) {
         for channel in channels.values {
@@ -119,6 +127,7 @@ public actor SwarmHost {
 
     private func adopt(channel: DataChannel, key: ObjectIdentifier) {
         channels[key] = channel
+        if let guestText { channel.onText = guestText }
     }
 
     private func forget(channel channelKey: ObjectIdentifier?, peer peerKey: ObjectIdentifier) {
