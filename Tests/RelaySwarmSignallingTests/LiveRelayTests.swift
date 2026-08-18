@@ -1,5 +1,6 @@
 import XCTest
 @testable import RelaySwarmSignalling
+import RelaySwarmTestSupport
 
 /// Off by default: exercises the real websocket transport against public
 /// relays. `RELAYSWARM_LIVE=1 swift test --filter LiveRelayTests` runs it.

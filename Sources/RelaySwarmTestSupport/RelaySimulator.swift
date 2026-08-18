@@ -1,11 +1,13 @@
 import Foundation
-@testable import RelaySwarmSignalling
+import RelaySwarmSignalling
 
 /// An in-process relay honouring the slice of NIP-01 the swarm uses:
 /// REQ with filters, EVENT with OK and fan-out, CLOSE. Ephemeral semantics
 /// on purpose - nothing is stored, matching how real relays treat the
 /// 20000-range kinds the swarm signals on.
-final class SimulatedRelay: @unchecked Sendable {
+public final class SimulatedRelay: @unchecked Sendable {
+    public init() {}
+
     actor Core {
         struct Client {
             var subscriptions = [String: [NostrFilter]]()
@@ -78,11 +80,11 @@ final class SimulatedRelay: @unchecked Sendable {
 
     let core = Core()
 
-    func makeTransport() -> RelayTransport {
+    public func makeTransport() -> RelayTransport {
         SimulatedTransport(core: core)
     }
 
-    func capturedEvents() async -> [NostrEvent] {
+    public func capturedEvents() async -> [NostrEvent] {
         await core.captured
     }
 }
@@ -115,11 +117,11 @@ final class SimulatedTransport: RelayTransport, @unchecked Sendable {
     }
 }
 
-enum TestTimeout: Error { case expired }
+public enum TestTimeout: Error { case expired }
 
 /// First element of a stream, or a thrown timeout - so a broken signalling
 /// path fails a test instead of hanging the suite.
-func firstElement<T: Sendable>(of stream: AsyncStream<T>, timeoutSeconds: Double = 5) async throws -> T {
+public func firstElement<T: Sendable>(of stream: AsyncStream<T>, timeoutSeconds: Double = 5) async throws -> T {
     try await withThrowingTaskGroup(of: T?.self) { group in
         group.addTask {
             for await element in stream { return element }

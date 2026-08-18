@@ -1,5 +1,6 @@
 import XCTest
 @testable import RelaySwarmSignalling
+import RelaySwarmTestSupport
 
 /// The whole rendezvous, end to end against the simulated relay: announce,
 /// discover, encrypted offer, encrypted answer - and proof that the SDP

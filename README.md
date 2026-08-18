@@ -26,6 +26,22 @@ whatever WebRTC stack it prefers.
 - **Throwaway identities.** Keys are generated per session and tied to
   nothing.
 
+## The transport product
+
+`RelaySwarmTransport` adds the pipe: WebRTC data channels over
+[libdatachannel](https://github.com/paullouisageneau/libdatachannel),
+shipped as a prebuilt static xcframework so consumers need SPM and nothing
+else. `SwarmHost` is the origin side - announce, answer every viewer's
+encrypted offer, broadcast to the open channels - and `SwarmGuest` is the
+native viewer side. A watcher announces itself on joining and the host
+re-announces immediately, so discovery costs a round trip rather than a
+wait. The binary slice is macos-arm64 today; Intel and iOS slices are
+further cmake runs of the same script (`scripts/build-xcframework.sh`).
+
+`RelaySwarmTestSupport` publishes the in-process relay the suites run
+against, so integrations can be tested the same way: full journeys,
+no network, and an assertion that no SDP ever crossed the wire readable.
+
 ## What is deliberately not here
 
 Segment scheduling, origin fallback budgets, churn handling and the HLS

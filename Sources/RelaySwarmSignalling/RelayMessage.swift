@@ -61,14 +61,14 @@ public enum RelayMessage {
 extension NostrEvent {
     /// The event as a JSON object for embedding in a wire message. This is
     /// ordinary JSON, not the canonical id serialisation.
-    func jsonObject() throws -> [String: Any] {
+    public func jsonObject() throws -> [String: Any] {
         [
             "id": id, "pubkey": pubkey, "created_at": createdAt,
             "kind": kind, "tags": tags, "content": content, "sig": sig,
         ]
     }
 
-    init?(jsonObject: Any) {
+    public init?(jsonObject: Any) {
         guard let object = jsonObject as? [String: Any],
               let id = object["id"] as? String,
               let pubkey = object["pubkey"] as? String,

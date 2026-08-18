@@ -1,0 +1,4 @@
+module CDataChannel {
+    header "rtc.h"
+    export *
+}
