@@ -1,0 +1,4 @@
+module CRTC {
+    header "rtc.h"
+    export *
+}
