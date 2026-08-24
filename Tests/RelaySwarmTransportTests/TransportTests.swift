@@ -32,6 +32,39 @@ final class TransportTests: XCTestCase {
         channel.close()
     }
 
+    /// Same in-process pair, but binary end to end: NUL bytes and a few KB
+    /// of them, so a string-typed shortcut anywhere in the path corrupts or
+    /// truncates the payload and fails the assertion.
+    func testLoopbackBinaryRoundTrip() throws {
+        let sideA = PeerConnection(stunServers: [])
+        let sideB = PeerConnection(stunServers: [])
+        defer { sideA.close(); sideB.close() }
+
+        sideA.onGatheredDescription = { sdp, type in
+            if type == .offer { sideB.setRemote(sdp, type: .offer) }
+        }
+        sideB.onGatheredDescription = { sdp, type in
+            if type == .answer { sideA.setRemote(sdp, type: .answer) }
+        }
+        let echoed = expectation(description: "binary echoed")
+        sideB.onDataChannel = { channel in
+            channel.onMessage = { message in
+                if case .binary(let data) = message { channel.send(data) }
+            }
+        }
+        let channel = sideA.createDataChannel("binary-loopback")
+        // 8 KB cycling through every byte value, 0x00 included.
+        let payload = Data((0..<8192).map { UInt8($0 % 256) })
+        channel.onOpen = { channel.send(payload) }
+        channel.onMessage = { message in
+            guard case .binary(let data) = message else { return }
+            XCTAssertEqual(data, payload)
+            echoed.fulfill()
+        }
+        wait(for: [echoed], timeout: 10)
+        channel.close()
+    }
+
     /// The full watch journey over the simulated relay: host announces,
     /// guest offers encrypted, channel opens, a broadcast frame arrives,
     /// and the wire never carried a readable SDP.

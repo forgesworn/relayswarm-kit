@@ -55,6 +55,14 @@ public struct NostrEvent: Codable, Equatable, Sendable {
         return xonly.isValid(signature, for: &message)
     }
 
+    /// Recency, tolerant of clock skew. The swarm's kinds are ephemeral:
+    /// an event stamped more than ten minutes ahead or over an hour back
+    /// is a relay replaying old traffic, not a live signal.
+    public var isFresh: Bool {
+        let now = Int64(Date().timeIntervalSince1970)
+        return createdAt <= now + 600 && createdAt >= now - 3600
+    }
+
     /// First value of the named tag, if present.
     public func tagValue(_ name: String) -> String? {
         tags.first(where: { $0.count >= 2 && $0[0] == name })?[1]

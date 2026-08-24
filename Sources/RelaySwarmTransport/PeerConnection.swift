@@ -100,13 +100,23 @@ public final class PeerConnection {
     }
 }
 
-/// One data channel: text out, text in, closure on close.
+/// One data channel: text and binary out, text and binary in, closure on close.
 public final class DataChannel {
+    /// A frame off the wire. Binary frames carry their bytes verbatim,
+    /// NULs included - anything that only handles String loses them.
+    public enum Message: Sendable {
+        case text(String)
+        case binary(Data)
+    }
+
     let id: Int32
     private var retained: Unmanaged<DataChannel>?
 
     public var onOpen: (@Sendable () -> Void)?
     public var onText: (@Sendable (String) -> Void)?
+    /// Every frame, text and binary alike; onText still fires for text, so
+    /// a text-only consumer does not have to switch to this.
+    public var onMessage: (@Sendable (Message) -> Void)?
     public var onClosed: (@Sendable () -> Void)?
 
     init(adopting id: Int32) {
@@ -118,10 +128,18 @@ public final class DataChannel {
             Unmanaged<DataChannel>.fromOpaque(pointer).takeUnretainedValue().onOpen?()
         }
         rtcSetMessageCallback(id) { _, message, size, pointer in
-            // Negative size is this API's way of saying null-terminated text.
-            guard let message, let pointer, size < 0 else { return }
+            guard let pointer else { return }
             let channel = Unmanaged<DataChannel>.fromOpaque(pointer).takeUnretainedValue()
-            channel.onText?(String(cString: message))
+            if size < 0 {
+                // Negative size is this API's way of saying null-terminated text.
+                guard let message else { return }
+                let text = String(cString: message)
+                channel.onText?(text)
+                channel.onMessage?(.text(text))
+            } else {
+                let data = size > 0 ? Data(bytes: message!, count: Int(size)) : Data()
+                channel.onMessage?(.binary(data))
+            }
         }
         rtcSetClosedCallback(id) { _, pointer in
             guard let pointer else { return }
@@ -133,6 +151,18 @@ public final class DataChannel {
     @discardableResult
     public func send(_ text: String) -> Bool {
         rtcSendMessage(id, text, -1) >= 0
+    }
+
+    /// Send binary; false when the channel is not open. A non-negative size
+    /// is what tells the C API - and the receiving side - this is bytes,
+    /// not a null-terminated string.
+    @discardableResult
+    public func send(_ data: Data) -> Bool {
+        guard !data.isEmpty else { return rtcSendMessage(id, nil, 0) >= 0 }
+        return data.withUnsafeBytes { buffer in
+            rtcSendMessage(id, buffer.baseAddress?.assumingMemoryBound(to: CChar.self),
+                           Int32(buffer.count)) >= 0
+        }
     }
 
     public func close() {

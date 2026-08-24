@@ -6,7 +6,9 @@ on:
 
 jobs:
   test:
-    runs-on: macos-14
+    # macos-15's default Xcode ships a Swift 6 toolchain; macos-14 defaults
+    # to Swift 5.10, which cannot resolve swift-secp256k1 (tools 6.0).
+    runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
       - name: Run tests

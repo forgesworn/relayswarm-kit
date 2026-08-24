@@ -1,6 +1,6 @@
 # RelaySwarmKit
 
-Swift implementation of [RelaySwarm](https://github.com/forgesworn/RelaySwarm)
+Swift implementation of [RelaySwarm](https://github.com/forgesworn/relayswarm)
 signalling: WebRTC peer rendezvous over Nostr relays, for Apple platforms.
 
 RelaySwarm's claim is that a live stream's own Nostr relays can carry the

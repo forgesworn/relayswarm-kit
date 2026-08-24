@@ -8,35 +8,48 @@ import Foundation
 public actor RelayPool {
     private let connections: [RelayConnection]
     private var seen = Set<String>()
+    /// Insertion order for `seen`, so the oldest ids are the ones evicted.
+    private var seenOldestFirst = [String]()
+    /// Well past what presence and signalling produce; the cap exists so a
+    /// long-lived pool's dedup memory does not grow without bound.
+    private let seenLimit = 4096
 
     public init(connections: [RelayConnection]) {
         self.connections = connections
     }
 
-    /// Connect to every relay; succeeds if at least one comes up.
+    /// Connect to every relay at once; succeeds if at least one comes up.
     public func connect() async throws {
-        var upCount = 0
-        for connection in connections {
-            do {
-                try await connection.connect()
-                upCount += 1
-            } catch {
-                continue
+        let upCount = await withTaskGroup(of: Bool.self) { group in
+            for connection in connections {
+                group.addTask { (try? await connection.connect()) != nil }
             }
+            var count = 0
+            for await up in group where up { count += 1 }
+            return count
         }
         guard upCount > 0 else { throw RelayError.notConnected }
     }
 
-    /// Publish everywhere; succeeds if at least one relay accepts.
+    /// Publish everywhere at once; succeeds if at least one relay accepts.
+    /// Concurrent because relays answer independently - awaiting each in
+    /// turn would sum their latencies into every signal.
     public func publish(_ event: NostrEvent) async throws {
         var lastError: Error = RelayError.notConnected
         var accepted = false
-        for connection in connections {
-            do {
-                try await connection.publish(event)
-                accepted = true
-            } catch {
-                lastError = error
+        await withTaskGroup(of: Error?.self) { group in
+            for connection in connections {
+                group.addTask {
+                    do {
+                        try await connection.publish(event)
+                        return nil
+                    } catch {
+                        return error
+                    }
+                }
+            }
+            for await failure in group {
+                if let failure { lastError = failure } else { accepted = true }
             }
         }
         guard accepted else { throw lastError }
@@ -71,6 +84,11 @@ public actor RelayPool {
     }
 
     private func firstSighting(of id: String) -> Bool {
-        seen.insert(id).inserted
+        guard seen.insert(id).inserted else { return false }
+        seenOldestFirst.append(id)
+        if seenOldestFirst.count > seenLimit {
+            seen.remove(seenOldestFirst.removeFirst())
+        }
+        return true
     }
 }

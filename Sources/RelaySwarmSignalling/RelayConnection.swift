@@ -96,8 +96,10 @@ public actor RelayConnection {
                 continuation.resume(throwing: RelayError.rejected(reason))
             }
         case .event(let subscription, let event):
-            // Nothing off the wire is believed until the signature checks.
-            guard event.isValid else { return }
+            // Nothing off the wire is believed until the signature checks,
+            // and a replayed event is not believed either: relays can
+            // redeliver stale ephemeral traffic long after it mattered.
+            guard event.isValid, event.isFresh else { return }
             subscriptions[subscription]?.yield(event)
         case .closed(let subscription, _):
             subscriptions.removeValue(forKey: subscription)?.finish()

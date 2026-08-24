@@ -1,7 +1,7 @@
 import Foundation
 
 /// The RelaySwarm wire format, matching the proof of concept in
-/// forgesworn/RelaySwarm so implementations interoperate.
+/// forgesworn/relayswarm so implementations interoperate.
 ///
 /// Kinds sit in the ephemeral range: relays fan them out to live
 /// subscriptions and store nothing. Version 2 is this implementation's

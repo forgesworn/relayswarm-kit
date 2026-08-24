@@ -115,4 +115,45 @@ final class SignallingJourneyTests: XCTestCase {
         }
         XCTAssertNil(extra)
     }
+
+    func testStaleAndFutureEventsAreNotDelivered() async throws {
+        let relay = SimulatedRelay()
+        let pool = RelayPool(connections: [RelayConnection(transport: relay.makeTransport())])
+        try await pool.connect()
+
+        let filter = NostrFilter(kinds: [SwarmWire.presenceKind], tags: [SwarmWire.swarmTag: ["freshness"]])
+        let events = await pool.subscribe([filter])
+
+        let keys = NostrKeys.generate()
+        let now = Int64(Date().timeIntervalSince1970)
+        func replay(createdAt: Int64) throws -> NostrEvent {
+            // Validly signed at the stamped time, so only the freshness
+            // check - not signature verification - can drop it.
+            try NostrEvent.signed(kind: SwarmWire.presenceKind,
+                                  tags: [[SwarmWire.swarmTag, "freshness"]],
+                                  content: "{\"role\":\"seeder\",\"v\":2}",
+                                  createdAt: createdAt, keys: keys)
+        }
+        try await pool.publish(replay(createdAt: now - 7200))
+        try await pool.publish(replay(createdAt: now + 3600))
+        try await pool.publish(replay(createdAt: now))
+
+        let fresh = try await firstElement(of: events)
+        XCTAssertEqual(fresh.createdAt, now)
+
+        // The two replays surfacing here would fail; a short quiet window
+        // with nothing else is the pass.
+        var iterator = events.makeAsyncIterator()
+        let extra = await withTaskGroup(of: NostrEvent?.self) { group in
+            group.addTask { await iterator.next() }
+            group.addTask {
+                try? await Task.sleep(nanoseconds: 300_000_000)
+                return nil
+            }
+            let result = await group.next() ?? nil
+            group.cancelAll()
+            return result
+        }
+        XCTAssertNil(extra)
+    }
 }
