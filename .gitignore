@@ -2,3 +2,8 @@
 .swiftpm/
 xcuserdata/
 .DS_Store
+
+# Xcode/SwiftPM output under the vendored binary directory
+build/Debug/
+build/GeneratedModuleMaps/
+build/RelaySwarmKit.build/

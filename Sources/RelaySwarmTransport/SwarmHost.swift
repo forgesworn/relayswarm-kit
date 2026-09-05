@@ -43,7 +43,7 @@ public actor SwarmHost {
         tasks.append(Task {
             for await signal in signals where signal.type == "offer" {
                 guard let sdp = signal.sdp else { continue }
-                await self.answer(offerSDP: sdp, viewer: signal.from)
+                self.answer(offerSDP: sdp, viewer: signal.from)
             }
         })
         // A watcher arriving announces itself, and the origin answers with a
@@ -204,14 +204,16 @@ public actor SwarmGuest {
     private func offer(to origin: String, signals: AsyncStream<SwarmSignal>) async throws -> DataChannel {
         let peer = PeerConnection(stunServers: stunServers)
         self.peer = peer
+        // Creating the first data channel starts offer gathering. Install
+        // the native callback first so a fast local gather cannot disappear.
+        peer.onGatheredDescription = { [signaller] sdp, type in
+            guard type == .offer else { return }
+            Task { try? await signaller.send(type: "offer", sdp: sdp, to: origin) }
+        }
         let channel = peer.createDataChannel("watch")
 
         let opened = AsyncStream<Void> { continuation in
             channel.onOpen = { continuation.yield(()); continuation.finish() }
-        }
-        peer.onGatheredDescription = { [signaller] sdp, type in
-            guard type == .offer else { return }
-            Task { try? await signaller.send(type: "offer", sdp: sdp, to: origin) }
         }
         let answers = Task {
             for await signal in signals where signal.type == "answer" && signal.from == origin {

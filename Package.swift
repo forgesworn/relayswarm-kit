@@ -3,7 +3,7 @@ import PackageDescription
 
 let package = Package(
     name: "RelaySwarmKit",
-    platforms: [.macOS(.v13), .iOS(.v16)],
+    platforms: [.macOS(.v14), .iOS(.v16)],
     products: [
         .library(name: "RelaySwarmSignalling", targets: ["RelaySwarmSignalling"]),
         // Rendezvous plus the pipe: WebRTC data channels over libdatachannel,
@@ -20,8 +20,13 @@ let package = Package(
                 dependencies: [.product(name: "P256K", package: "swift-secp256k1")]),
         .binaryTarget(
             name: "CDataChannel",
-            url: "https://github.com/forgesworn/relayswarm-kit/releases/download/v0.1.0/DataChannel.xcframework.zip",
-            checksum: "a39448b7940c00cfb1a8ec550d2692412e85d48c12d443df1486dedd7ae2f5f3"),
+            // The checked-in archive, not a release download. The v0.1.0
+            // asset is the older build, 113 of whose objects want macOS
+            // 14.6, so consuming it by URL would reinstate the deployment
+            // target this package declares it does not need. Cutting a
+            // release from build/DataChannel.xcframework.zip is what would
+            // let this go back to url/checksum.
+            path: "build/DataChannel.xcframework"),
         .target(name: "RelaySwarmTransport",
                 dependencies: ["RelaySwarmSignalling", "CDataChannel"],
                 linkerSettings: [.linkedLibrary("c++")]),

@@ -11,5 +11,7 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+      - name: Verify bundled data channel
+        run: scripts/verify-xcframework.sh
       - name: Run tests
         run: swift test
