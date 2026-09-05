@@ -44,12 +44,22 @@ public actor RelayPool {
 
     /// One merged stream across every relay, deduplicated by event id.
     public func subscribe(_ filters: [NostrFilter]) async -> AsyncStream<NostrEvent> {
-        AsyncStream { continuation in
+        // These kinds are ephemeral: returning before the upstream REQs are
+        // installed creates a gap in which presence or SDP events vanish.
+        // Establish every reachable subscription before handing the caller
+        // its merged stream.
+        var upstreams = [AsyncStream<NostrEvent>]()
+        for connection in connections {
+            if let (_, events) = try? await connection.subscribe(filters) {
+                upstreams.append(events)
+            }
+        }
+
+        return AsyncStream { continuation in
             let forwarders = Task {
                 await withTaskGroup(of: Void.self) { group in
-                    for connection in self.connections {
+                    for events in upstreams {
                         group.addTask {
-                            guard let (_, events) = try? await connection.subscribe(filters) else { return }
                             for await event in events {
                                 if await self.firstSighting(of: event.id) {
                                     continuation.yield(event)

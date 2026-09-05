@@ -1,0 +1,8 @@
+format=1
+libdatachannel_commit=51085b8de4e6185dc019e3705c88b87933d7c3f6
+libdatachannel_version=0.24.5
+openssl_version=OpenSSL 3.6.1 27 Jan 2026
+macos_minimum=14.0
+architecture=arm64
+merged_sha256=d57530cdf81573f590611b416a9767a8fbbe774c13e94394bea62d5e29fcde90
+swiftpm_checksum=44ea8643f5f5f6fcb957296cefe8cc6dfb9f1e127f07cae063f66a8cfbe4833a

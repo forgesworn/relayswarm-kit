@@ -27,9 +27,9 @@ public actor RelayConnection {
             for await signal in incoming {
                 switch signal {
                 case .text(let text):
-                    await self.handle(RelayMessage.decode(text))
+                    self.handle(RelayMessage.decode(text))
                 case .closed:
-                    await self.handleClosed()
+                    self.handleClosed()
                 }
             }
         }
@@ -49,12 +49,12 @@ public actor RelayConnection {
                 do {
                     try await self.transport.send(frame)
                 } catch {
-                    await self.failPublish(event.id, error)
+                    self.failPublish(event.id, error)
                 }
             }
             Task {
                 try? await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
-                await self.expirePublish(event.id)
+                self.expirePublish(event.id)
             }
         }
     }

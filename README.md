@@ -35,7 +35,10 @@ else. `SwarmHost` is the origin side - announce, answer every viewer's
 encrypted offer, broadcast to the open channels - and `SwarmGuest` is the
 native viewer side. A watcher announces itself on joining and the host
 re-announces immediately, so discovery costs a round trip rather than a
-wait. The binary slice is macos-arm64 today; Intel and iOS slices are
+wait. The checked-in binary is built for macOS 14.0 and verified object by
+object in CI. Its exact source commit, dependency version, architecture and
+checksums are recorded in `build/DataChannel.provenance`. The binary slice
+is macos-arm64 today; Intel and iOS slices are
 further cmake runs of the same script (`scripts/build-xcframework.sh`).
 
 `RelaySwarmTestSupport` publishes the in-process relay the suites run

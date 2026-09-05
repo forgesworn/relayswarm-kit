@@ -100,7 +100,7 @@ public actor SwarmSignaller {
         return AsyncStream { continuation in
             let task = Task {
                 for await event in events {
-                    if let signal = await self.decode(event) {
+                    if let signal = self.decode(event) {
                         continuation.yield(signal)
                     }
                 }
