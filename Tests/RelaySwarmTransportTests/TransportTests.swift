@@ -181,6 +181,45 @@ final class TransportTests: XCTestCase {
         XCTAssertEqual(order.withValue { $0 }, ["frame 0", "frame 1", "frame 2", "binary:3"])
         channel.close()
     }
+
+    /// The negotiated ceiling is honoured on both sides of it: a frame of
+    /// exactly maxMessageSize round-trips intact, and one byte more is
+    /// refused by send, synchronously, rather than vanishing in transit.
+    func testMaximumMessageSizeRoundTripsAndOneByteMoreIsRefused() throws {
+        let sideA = PeerConnection(stunServers: [])
+        let sideB = PeerConnection(stunServers: [])
+        defer { sideA.close(); sideB.close() }
+        sideA.onGatheredDescription = { sdp, type in
+            if type == .offer { sideB.setRemote(sdp, type: .offer) }
+        }
+        sideB.onGatheredDescription = { sdp, type in
+            if type == .answer { sideA.setRemote(sdp, type: .answer) }
+        }
+        sideB.onDataChannel = { channel in
+            channel.onMessage = { message in
+                if case .binary(let data) = message { channel.send(data) }
+            }
+        }
+        let channel = sideA.createDataChannel("ceiling")
+        let opened = expectation(description: "open")
+        channel.onOpen = { opened.fulfill() }
+        wait(for: [opened], timeout: 10)
+
+        let limit = channel.maxMessageSize
+        XCTAssertGreaterThanOrEqual(limit, 65_536, "a ceiling below 64 KiB is a negotiation surprise worth failing on")
+        let payload = Data((0..<limit).map { UInt8($0 % 256) })
+        let echoed = expectation(description: "frame at the ceiling echoed")
+        channel.onMessage = { message in
+            guard case .binary(let data) = message else { return }
+            XCTAssertEqual(data.count, limit)
+            XCTAssertEqual(data, payload)
+            echoed.fulfill()
+        }
+        XCTAssertTrue(channel.send(payload), "a frame of exactly maxMessageSize must be accepted")
+        wait(for: [echoed], timeout: 10)
+        XCTAssertFalse(channel.send(payload + Data([0])), "one byte over the ceiling must be refused, not dropped")
+        channel.close()
+    }
 }
 
 /// A value the test can hand to @Sendable callbacks and read back.

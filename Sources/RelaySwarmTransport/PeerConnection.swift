@@ -320,15 +320,24 @@ public final class DataChannel {
         any?(message)
     }
 
-    /// Send text; false when the channel is not open.
+    /// The largest frame this channel will carry, negotiated with the remote
+    /// at connection time (libdatachannel's default is 256 KiB). A send of
+    /// anything larger is refused synchronously; a caller moving more than
+    /// this chunks to it.
+    public var maxMessageSize: Int {
+        Int(max(rtcMaxMessageSize(id), 0))
+    }
+
+    /// Send text; false when the channel is not open or the frame exceeds
+    /// maxMessageSize.
     @discardableResult
     public func send(_ text: String) -> Bool {
         rtcSendMessage(id, text, -1) >= 0
     }
 
-    /// Send binary; false when the channel is not open. A non-negative size
-    /// is what tells the C API - and the receiving side - this is bytes,
-    /// not a null-terminated string.
+    /// Send binary; false when the channel is not open or the frame exceeds
+    /// maxMessageSize. A non-negative size is what tells the C API - and the
+    /// receiving side - this is bytes, not a null-terminated string.
     @discardableResult
     public func send(_ data: Data) -> Bool {
         guard !data.isEmpty else { return rtcSendMessage(id, nil, 0) >= 0 }
