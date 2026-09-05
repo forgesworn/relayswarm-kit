@@ -105,4 +105,91 @@ final class TransportTests: XCTestCase {
         await guest.close()
         await host.stop()
     }
+
+    /// On loopback the handshake finishes in a few milliseconds, sooner than
+    /// a caller building its payload gets to assign onOpen. The open must
+    /// wait for the handler, and fire exactly once.
+    func testOpenLatchesUntilHandlerInstalled() throws {
+        let sideA = PeerConnection(stunServers: [])
+        let sideB = PeerConnection(stunServers: [])
+        defer { sideA.close(); sideB.close() }
+        sideA.onGatheredDescription = { sdp, type in
+            if type == .offer { sideB.setRemote(sdp, type: .offer) }
+        }
+        sideB.onGatheredDescription = { sdp, type in
+            if type == .answer { sideA.setRemote(sdp, type: .answer) }
+        }
+        let remoteSawChannel = expectation(description: "remote channel")
+        sideB.onDataChannel = { _ in remoteSawChannel.fulfill() }
+        let channel = sideA.createDataChannel("late-open")
+        wait(for: [remoteSawChannel], timeout: 10)
+        // The remote has answered the OPEN; our side's open callback has fired
+        // by now, into a channel with no handler.
+        Thread.sleep(forTimeInterval: 0.2)
+
+        let opened = expectation(description: "late handler sees the open")
+        opened.assertForOverFulfill = true
+        channel.onOpen = { opened.fulfill() }
+        wait(for: [opened], timeout: 2)
+        // Reassigning must not replay it a second time.
+        channel.onOpen = { XCTFail("open replayed twice") }
+        Thread.sleep(forTimeInterval: 0.1)
+        channel.close()
+    }
+
+    /// Frames that land before the receiving side has any handler queue,
+    /// in order, until it does. Nothing is dropped and nothing reorders.
+    func testMessagesQueueUntilHandlerInstalled() throws {
+        let sideA = PeerConnection(stunServers: [])
+        let sideB = PeerConnection(stunServers: [])
+        defer { sideA.close(); sideB.close() }
+        sideA.onGatheredDescription = { sdp, type in
+            if type == .offer { sideB.setRemote(sdp, type: .offer) }
+        }
+        sideB.onGatheredDescription = { sdp, type in
+            if type == .answer { sideA.setRemote(sdp, type: .answer) }
+        }
+        let remote = Locked<DataChannel?>(nil)
+        let channelArrived = expectation(description: "remote channel")
+        sideB.onDataChannel = { channel in
+            remote.withValue { $0 = channel }   // deliberately no message handler yet
+            channelArrived.fulfill()
+        }
+        let channel = sideA.createDataChannel("late-handler")
+        let opened = expectation(description: "open")
+        channel.onOpen = { opened.fulfill() }
+        wait(for: [channelArrived, opened], timeout: 10)
+
+        for i in 0..<3 { XCTAssertTrue(channel.send("frame \(i)")) }
+        XCTAssertTrue(channel.send(Data([0, 1, 2])))
+        // All four are on the remote side with nowhere to go.
+        Thread.sleep(forTimeInterval: 0.2)
+
+        let order = Locked<[String]>([])
+        let received = expectation(description: "four frames")
+        received.expectedFulfillmentCount = 4
+        remote.withValue { $0 }!.onMessage = { message in
+            order.withValue {
+                switch message {
+                case .text(let string): $0.append(string)
+                case .binary(let data): $0.append("binary:\(data.count)")
+                }
+            }
+            received.fulfill()
+        }
+        wait(for: [received], timeout: 2)
+        XCTAssertEqual(order.withValue { $0 }, ["frame 0", "frame 1", "frame 2", "binary:3"])
+        channel.close()
+    }
+}
+
+/// A value the test can hand to @Sendable callbacks and read back.
+private final class Locked<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Value
+    init(_ value: Value) { self.value = value }
+    func withValue<Result>(_ body: (inout Value) -> Result) -> Result {
+        lock.lock(); defer { lock.unlock() }
+        return body(&value)
+    }
 }

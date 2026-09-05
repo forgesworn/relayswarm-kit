@@ -9,6 +9,14 @@ import Foundation
 /// spent locally is cheaper than trickling candidates through them.
 ///
 /// Callbacks arrive on libdatachannel's own threads; callers marshal.
+///
+/// Handlers may be installed after the event they want has already fired.
+/// On loopback the whole handshake completes in a few milliseconds, which
+/// is sooner than the caller's next line of Swift, so nothing here is
+/// allowed to depend on assignment order: a gathered description or a
+/// close that fired before its handler existed is replayed once when the
+/// handler arrives, and channels the remote opened early queue until
+/// onDataChannel is set.
 public final class PeerConnection {
     public enum DescriptionType: String { case offer, answer }
 
@@ -17,12 +25,25 @@ public final class PeerConnection {
     private let lock = NSLock()
     private var channels = [Int32: DataChannel]()
 
+    private var gathered: (String, DescriptionType)?
+    private var gatherDelivered = false
+    private var pendingChannels = [DataChannel]()
+    private var drainingChannels = false
+    private var closedEarly = false
+    private var closeDelivered = false
+
     /// Fires once gathering completes, with the full local description.
-    public var onGatheredDescription: (@Sendable (String, DescriptionType) -> Void)?
+    public var onGatheredDescription: (@Sendable (String, DescriptionType) -> Void)? {
+        didSet { replayGatheredIfNeeded() }
+    }
     /// Fires when the remote side opens a channel towards us.
-    public var onDataChannel: (@Sendable (DataChannel) -> Void)?
+    public var onDataChannel: (@Sendable (DataChannel) -> Void)? {
+        didSet { flushPendingChannels() }
+    }
     /// Fires when the connection fails or closes.
-    public var onClosed: (@Sendable () -> Void)?
+    public var onClosed: (@Sendable () -> Void)? {
+        didSet { replayCloseIfNeeded() }
+    }
 
     public init(stunServers: [String] = ["stun:stun.l.google.com:19302"]) {
         var cStrings = stunServers.map { UnsafePointer<CChar>?(strdup($0)) }
@@ -48,7 +69,7 @@ public final class PeerConnection {
             let type = rtcGetLocalDescriptionType(id, &typeBuffer, Int32(typeBuffer.count)) >= 0
                 ? DescriptionType(rawValue: String(cString: typeBuffer)) ?? .answer
                 : .answer
-            connection.onGatheredDescription?(String(cString: buffer), type)
+            connection.didGather(String(cString: buffer), type)
         }
         rtcSetDataChannelCallback(id) { _, channelID, pointer in
             guard let pointer else { return }
@@ -57,14 +78,76 @@ public final class PeerConnection {
             connection.lock.lock()
             connection.channels[channelID] = channel
             connection.lock.unlock()
-            connection.onDataChannel?(channel)
+            connection.didReceiveChannel(channel)
         }
         rtcSetStateChangeCallback(id) { _, state, pointer in
             guard let pointer,
                   state == RTC_CLOSED || state == RTC_FAILED || state == RTC_DISCONNECTED else { return }
             let connection = Unmanaged<PeerConnection>.fromOpaque(pointer).takeUnretainedValue()
-            connection.onClosed?()
+            connection.didClose()
         }
+    }
+
+    private func didGather(_ sdp: String, _ type: DescriptionType) {
+        lock.lock()
+        gathered = (sdp, type)
+        let handler = onGatheredDescription
+        gatherDelivered = handler != nil
+        lock.unlock()
+        handler?(sdp, type)
+    }
+
+    private func replayGatheredIfNeeded() {
+        lock.lock()
+        guard let (sdp, type) = gathered, !gatherDelivered, let handler = onGatheredDescription else {
+            lock.unlock()
+            return
+        }
+        gatherDelivered = true
+        lock.unlock()
+        handler(sdp, type)
+    }
+
+    private func didReceiveChannel(_ channel: DataChannel) {
+        lock.lock()
+        guard let handler = onDataChannel, !drainingChannels, pendingChannels.isEmpty else {
+            pendingChannels.append(channel)
+            lock.unlock()
+            return
+        }
+        lock.unlock()
+        handler(channel)
+    }
+
+    private func flushPendingChannels() {
+        lock.lock()
+        if drainingChannels { lock.unlock(); return }
+        drainingChannels = true
+        while let next = pendingChannels.first, let handler = onDataChannel {
+            pendingChannels.removeFirst()
+            lock.unlock()
+            handler(next)
+            lock.lock()
+        }
+        drainingChannels = false
+        lock.unlock()
+    }
+
+    private func didClose() {
+        lock.lock()
+        closedEarly = true
+        let handler = onClosed
+        if handler != nil { closeDelivered = true }
+        lock.unlock()
+        handler?()
+    }
+
+    private func replayCloseIfNeeded() {
+        lock.lock()
+        guard closedEarly, !closeDelivered, let handler = onClosed else { lock.unlock(); return }
+        closeDelivered = true
+        lock.unlock()
+        handler()
     }
 
     /// Open a channel towards the remote side; makes this peer the offerer.
@@ -101,6 +184,13 @@ public final class PeerConnection {
 }
 
 /// One data channel: text and binary out, text and binary in, closure on close.
+///
+/// Same rule as the connection: handlers may arrive after the event. An open
+/// that fired before onOpen was set fires once when it is set, and frames
+/// that arrived before any message handler existed are queued, in order,
+/// and delivered when one is installed. Without this, a caller who builds
+/// an 8 KB payload between createDataChannel and onOpen on a loopback pair
+/// loses the open and never sends.
 public final class DataChannel {
     /// A frame off the wire. Binary frames carry their bytes verbatim,
     /// NULs included - anything that only handles String loses them.
@@ -111,13 +201,28 @@ public final class DataChannel {
 
     let id: Int32
     private var retained: Unmanaged<DataChannel>?
+    private let lock = NSLock()
+    private var opened = false
+    private var openDelivered = false
+    private var closedEarly = false
+    private var closeDelivered = false
+    private var pending = [Message]()
+    private var draining = false
 
-    public var onOpen: (@Sendable () -> Void)?
-    public var onText: (@Sendable (String) -> Void)?
+    public var onOpen: (@Sendable () -> Void)? {
+        didSet { replayOpenIfNeeded() }
+    }
+    public var onText: (@Sendable (String) -> Void)? {
+        didSet { flushPending() }
+    }
     /// Every frame, text and binary alike; onText still fires for text, so
     /// a text-only consumer does not have to switch to this.
-    public var onMessage: (@Sendable (Message) -> Void)?
-    public var onClosed: (@Sendable () -> Void)?
+    public var onMessage: (@Sendable (Message) -> Void)? {
+        didSet { flushPending() }
+    }
+    public var onClosed: (@Sendable () -> Void)? {
+        didSet { replayCloseIfNeeded() }
+    }
 
     init(adopting id: Int32) {
         self.id = id
@@ -125,7 +230,7 @@ public final class DataChannel {
         rtcSetUserPointer(id, retained!.toOpaque())
         rtcSetOpenCallback(id) { _, pointer in
             guard let pointer else { return }
-            Unmanaged<DataChannel>.fromOpaque(pointer).takeUnretainedValue().onOpen?()
+            Unmanaged<DataChannel>.fromOpaque(pointer).takeUnretainedValue().didOpen()
         }
         rtcSetMessageCallback(id) { _, message, size, pointer in
             guard let pointer else { return }
@@ -133,18 +238,86 @@ public final class DataChannel {
             if size < 0 {
                 // Negative size is this API's way of saying null-terminated text.
                 guard let message else { return }
-                let text = String(cString: message)
-                channel.onText?(text)
-                channel.onMessage?(.text(text))
+                channel.receive(.text(String(cString: message)))
             } else {
-                let data = size > 0 ? Data(bytes: message!, count: Int(size)) : Data()
-                channel.onMessage?(.binary(data))
+                channel.receive(.binary(size > 0 ? Data(bytes: message!, count: Int(size)) : Data()))
             }
         }
         rtcSetClosedCallback(id) { _, pointer in
             guard let pointer else { return }
-            Unmanaged<DataChannel>.fromOpaque(pointer).takeUnretainedValue().onClosed?()
+            Unmanaged<DataChannel>.fromOpaque(pointer).takeUnretainedValue().didClose()
         }
+    }
+
+    private func didOpen() {
+        lock.lock()
+        opened = true
+        let handler = onOpen
+        if handler != nil { openDelivered = true }
+        lock.unlock()
+        handler?()
+    }
+
+    private func replayOpenIfNeeded() {
+        lock.lock()
+        guard opened, !openDelivered, let handler = onOpen else { lock.unlock(); return }
+        openDelivered = true
+        lock.unlock()
+        handler()
+    }
+
+    private func didClose() {
+        lock.lock()
+        closedEarly = true
+        let handler = onClosed
+        if handler != nil { closeDelivered = true }
+        lock.unlock()
+        handler?()
+    }
+
+    private func replayCloseIfNeeded() {
+        lock.lock()
+        guard closedEarly, !closeDelivered, let handler = onClosed else { lock.unlock(); return }
+        closeDelivered = true
+        lock.unlock()
+        handler()
+    }
+
+    /// Deliver now if a handler exists and nothing is queued ahead of this
+    /// frame; otherwise queue, so order survives a late handler.
+    private func receive(_ message: Message) {
+        lock.lock()
+        let handled = onText != nil || onMessage != nil
+        if !handled || draining || !pending.isEmpty {
+            pending.append(message)
+            lock.unlock()
+            return
+        }
+        let (text, any) = (onText, onMessage)
+        lock.unlock()
+        dispatch(message, text: text, any: any)
+    }
+
+    private func flushPending() {
+        lock.lock()
+        if draining { lock.unlock(); return }
+        draining = true
+        while let next = pending.first, onText != nil || onMessage != nil {
+            pending.removeFirst()
+            let (text, any) = (onText, onMessage)
+            lock.unlock()
+            dispatch(next, text: text, any: any)
+            lock.lock()
+        }
+        draining = false
+        lock.unlock()
+    }
+
+    private func dispatch(_ message: Message,
+                          text: (@Sendable (String) -> Void)?,
+                          any: (@Sendable (Message) -> Void)?) {
+        if case .text(let string) = message { text?(string) }
+        any?(message)
     }
 
     /// Send text; false when the channel is not open.
