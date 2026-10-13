@@ -1,7 +1,15 @@
 import XCTest
+import CryptoKit
 @testable import RelaySwarmSignalling
 
 final class EventTests: XCTestCase {
+    func testEveryJSONControlCharacterMatchesNostrToolsHash() {
+        let content = String(String.UnicodeScalarView((0..<32).map { UnicodeScalar($0)! })) + " ✓"
+        let event = NostrEvent(id: "", pubkey: "79be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+            createdAt: 1_755_500_000, kind: 24171, tags: [["x", "controls"]], content: content, sig: "")
+        // Independently computed with nostr-tools getEventHash, not Swift's encoder.
+        XCTAssertEqual(Data(SHA256.hash(data: Data(event.canonical.utf8))).hex, "1e9675e7e614cce756d56db76960e314553ac6ce05279f372b13f9285d6be330")
+    }
     /// A complete event produced by nostr-tools with fixed inputs. The id
     /// proves the canonical serialisation - escaping, unicode, tag layout -
     /// and the signature proves verification interoperates.

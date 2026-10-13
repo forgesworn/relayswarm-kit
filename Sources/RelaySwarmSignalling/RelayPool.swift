@@ -20,6 +20,7 @@ public actor RelayPool {
 
     /// Connect to every relay at once; succeeds if at least one comes up.
     public func connect() async throws {
+        guard connections.count <= 8 else { throw RelayError.resourceLimit }
         let upCount = await withTaskGroup(of: Bool.self) { group in
             for connection in connections {
                 group.addTask { (try? await connection.connect()) != nil }
@@ -68,7 +69,7 @@ public actor RelayPool {
             }
         }
 
-        return AsyncStream { continuation in
+        return AsyncStream(bufferingPolicy: .bufferingNewest(64)) { continuation in
             let forwarders = Task {
                 await withTaskGroup(of: Void.self) { group in
                     for events in upstreams {

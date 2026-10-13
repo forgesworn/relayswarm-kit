@@ -51,6 +51,7 @@ public final class PeerConnection {
         var config = rtcConfiguration()
         memset(&config, 0, MemoryLayout<rtcConfiguration>.size)
         id = cStrings.withUnsafeMutableBufferPointer { buffer -> Int32 in
+            config.maxMessageSize = 256 * 1024
             config.iceServers = buffer.baseAddress
             config.iceServersCount = Int32(buffer.count)
             return rtcCreatePeerConnection(&config)
@@ -76,6 +77,11 @@ public final class PeerConnection {
             let connection = Unmanaged<PeerConnection>.fromOpaque(pointer).takeUnretainedValue()
             let channel = DataChannel(adopting: channelID)
             connection.lock.lock()
+            guard connection.retained != nil, connection.channels.count < 16 else {
+                connection.lock.unlock()
+                DispatchQueue.global().async { channel.close() }
+                return
+            }
             connection.channels[channelID] = channel
             connection.lock.unlock()
             connection.didReceiveChannel(channel)
@@ -164,10 +170,10 @@ public final class PeerConnection {
     }
 
     public func close() {
-        guard let held = retained else { return }
-        retained = nil
         lock.lock()
-        let open = channels.values
+        guard let held = retained else { lock.unlock(); return }
+        retained = nil
+        let open = Array(channels.values)
         channels.removeAll()
         lock.unlock()
         for channel in open { channel.close() }
@@ -207,6 +213,10 @@ public final class DataChannel {
     private var closedEarly = false
     private var closeDelivered = false
     private var pending = [Message]()
+    private var pendingBytes = 0
+    private var boundsFailed = false
+    private let maxPendingFrames = 64
+    private let maxPendingBytes = 4 * 1024 * 1024
     private var draining = false
 
     public var onOpen: (@Sendable () -> Void)? {
@@ -287,9 +297,18 @@ public final class DataChannel {
     /// frame; otherwise queue, so order survives a late handler.
     private func receive(_ message: Message) {
         lock.lock()
+        guard retained != nil, !boundsFailed else { lock.unlock(); return }
         let handled = onText != nil || onMessage != nil
         if !handled || draining || !pending.isEmpty {
-            pending.append(message)
+            let size: Int
+            switch message { case .text(let text): size = text.utf8.count; case .binary(let data): size = data.count }
+            if pending.count >= maxPendingFrames || size > maxPendingBytes - pendingBytes {
+                boundsFailed = true; pending.removeAll(); pendingBytes = 0
+                lock.unlock()
+                DispatchQueue.global().async { self.close() }
+                return
+            }
+            pending.append(message); pendingBytes += size
             lock.unlock()
             return
         }
@@ -304,6 +323,7 @@ public final class DataChannel {
         draining = true
         while let next = pending.first, onText != nil || onMessage != nil {
             pending.removeFirst()
+            switch next { case .text(let text): pendingBytes -= text.utf8.count; case .binary(let data): pendingBytes -= data.count }
             let (text, any) = (onText, onMessage)
             lock.unlock()
             dispatch(next, text: text, any: any)
@@ -348,8 +368,10 @@ public final class DataChannel {
     }
 
     public func close() {
-        guard let held = retained else { return }
-        retained = nil
+        lock.lock()
+        guard let held = retained else { lock.unlock(); return }
+        retained = nil; pending.removeAll(); pendingBytes = 0
+        lock.unlock()
         rtcDeleteDataChannel(id)
         held.release()
     }

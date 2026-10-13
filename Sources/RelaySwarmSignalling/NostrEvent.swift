@@ -69,7 +69,8 @@ public struct NostrEvent: Codable, Equatable, Sendable {
     }
 
     /// NIP-01: `[0, pubkey, created_at, kind, tags, content]` with exactly
-    /// six characters escaped and everything else verbatim. A general JSON
+    /// the JSON escapes for quotes, backslashes and control characters.
+    /// All other Unicode scalars remain verbatim. A general JSON
     /// encoder is not usable here - it makes different escaping choices and
     /// the hash would no longer match other implementations.
     var canonical: String {
@@ -91,7 +92,9 @@ public struct NostrEvent: Codable, Equatable, Sendable {
             case "\t": out += "\\t"
             case "\u{8}": out += "\\b"
             case "\u{c}": out += "\\f"
-            default: out.unicodeScalars.append(character)
+            default:
+                if character.value < 32 { out += String(format: "\\u%04x", character.value) }
+                else { out.unicodeScalars.append(character) }
             }
         }
         return out

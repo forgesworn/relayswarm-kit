@@ -6,6 +6,8 @@ let package = Package(
     platforms: [.macOS(.v14), .iOS(.v16)],
     products: [
         .library(name: "RelaySwarmSignalling", targets: ["RelaySwarmSignalling"]),
+        .library(name: "RelaySwarmMedia", targets: ["RelaySwarmMedia"]),
+        .executable(name: "relayswarm-interop", targets: ["RelaySwarmInteropFixture"]),
         // Rendezvous plus the pipe: WebRTC data channels over libdatachannel,
         // with a host that answers viewers' encrypted offers. The binary
         // slice is macos-arm64 today; the signalling product runs everywhere.
@@ -18,6 +20,7 @@ let package = Package(
     targets: [
         .target(name: "RelaySwarmSignalling",
                 dependencies: [.product(name: "P256K", package: "swift-secp256k1")]),
+        .target(name: "RelaySwarmMedia", dependencies: ["RelaySwarmSignalling"]),
         .binaryTarget(
             name: "CDataChannel",
             // The checked-in archive, not a release download. The v0.1.0
@@ -28,14 +31,16 @@ let package = Package(
             // let this go back to url/checksum.
             path: "build/DataChannel.xcframework"),
         .target(name: "RelaySwarmTransport",
-                dependencies: ["RelaySwarmSignalling", "CDataChannel"],
+                dependencies: ["RelaySwarmSignalling", "RelaySwarmMedia", "CDataChannel"],
                 linkerSettings: [.linkedLibrary("c++")]),
         // The in-process relay the suites run against, published so
         // consumers can test their own integrations the same way.
         .target(name: "RelaySwarmTestSupport", dependencies: ["RelaySwarmSignalling"]),
         .testTarget(name: "RelaySwarmSignallingTests",
                     dependencies: ["RelaySwarmSignalling", "RelaySwarmTestSupport"]),
+        .executableTarget(name: "RelaySwarmInteropFixture", dependencies: ["RelaySwarmSignalling", "RelaySwarmTransport", "RelaySwarmMedia"], path: "Tests/Interop"),
+        .testTarget(name: "RelaySwarmMediaTests", dependencies: ["RelaySwarmMedia", "RelaySwarmSignalling"]),
         .testTarget(name: "RelaySwarmTransportTests",
-                    dependencies: ["RelaySwarmTransport", "RelaySwarmTestSupport"]),
+                    dependencies: ["RelaySwarmTransport", "RelaySwarmTestSupport", "RelaySwarmMedia"]),
     ]
 )

@@ -4,6 +4,43 @@ import RelaySwarmSignalling
 import RelaySwarmTestSupport
 
 final class TransportTests: XCTestCase {
+    func testUnconsumedRealChannelFloodClosesInsteadOfAccumulatingFrames() throws {
+        let a = PeerConnection(stunServers: []), b = PeerConnection(stunServers: [])
+        defer { a.close(); b.close() }
+        a.onGatheredDescription = { sdp, type in if type == .offer { b.setRemote(sdp, type: .offer) } }
+        b.onGatheredDescription = { sdp, type in if type == .answer { a.setRemote(sdp, type: .answer) } }
+        let remote = Locked<DataChannel?>(nil), arrived = expectation(description: "remote channel"), opened = expectation(description: "open"), closed = expectation(description: "flood closed")
+        b.onDataChannel = { channel in remote.withValue { $0 = channel }; arrived.fulfill() }
+        let channel = a.createDataChannel("unconsumed-flood")
+        channel.onOpen = { opened.fulfill() }; channel.onClosed = { closed.fulfill() }
+        wait(for: [arrived, opened], timeout: 10)
+        for _ in 0..<80 { channel.send(Data(repeating: 1, count: 1024)) }
+        wait(for: [closed], timeout: 5)
+        remote.withValue { $0 }?.onMessage = { _ in XCTFail("Overflowed frames survived channel closure") }
+    }
+    func testDefaultGuestAdmissionSendsNoOfferAndDeadlineClosesThePool() async throws {
+        let relay = SimulatedRelay(), originKeys = NostrKeys.generate()
+        let originPool = RelayPool(connections: [RelayConnection(transport: relay.makeTransport())])
+        try await originPool.connect()
+        let origin = SwarmSignaller(keys: originKeys, pool: originPool, swarmID: "denied-default-test")
+        let guest = SwarmGuest(pool: RelayPool(connections: [RelayConnection(transport: relay.makeTransport())]), swarmID: "denied-default-test")
+        let announcing = Task {
+            while !Task.isCancelled {
+                try? await origin.announcePresence(role: "seeder")
+                try? await Task.sleep(for: .milliseconds(20))
+            }
+        }
+        do { _ = try await guest.connect(timeoutSeconds: 0.15); XCTFail("Default admission connected") }
+        catch SwarmGuest.Failure.timedOut { }
+        announcing.cancel()
+        let events = await relay.capturedEvents()
+        XCTAssertFalse(events.contains(where: { $0.kind == SwarmWire.signalKind }))
+        // A failed attempt released its peer and connection state: retry can
+        // run and time out, rather than leaking an active/busy connection.
+        do { _ = try await guest.connect(timeoutSeconds: 0.01); XCTFail("Retry connected") }
+        catch SwarmGuest.Failure.timedOut { }
+        await guest.close(); await originPool.close()
+    }
     /// Two peers in one process: the whole ICE/DTLS/SCTP stack, no network.
     func testLoopbackDataChannel() throws {
         let sideA = PeerConnection(stunServers: [])
@@ -74,8 +111,8 @@ final class TransportTests: XCTestCase {
                              swarmID: "watch-test")
         let guest = SwarmGuest(pool: RelayPool(connections: [RelayConnection(transport: relay.makeTransport())]),
                                swarmID: "watch-test")
-        try await host.start()
-        let channel = try await guest.connect(timeoutSeconds: 15)
+        try await host.start(admitPeer: { _, _ in true })
+        let channel = try await guest.connect(timeoutSeconds: 15, admitPeer: { _ in true })
 
         let received = AsyncStream<String> { continuation in
             channel.onText = { continuation.yield($0) }
@@ -99,7 +136,7 @@ final class TransportTests: XCTestCase {
         // Privacy on the wire, same assertion the signalling suite makes.
         for event in await relay.capturedEvents() where event.kind == SwarmWire.signalKind {
             XCTAssertFalse(event.content.contains("sdp"))
-            XCTAssertEqual(event.tagValue(SwarmWire.versionTag), SwarmWire.encryptedVersion)
+            XCTAssertNil(event.tagValue("v"))
         }
 
         await guest.close()

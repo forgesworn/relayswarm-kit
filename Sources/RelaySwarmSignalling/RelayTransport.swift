@@ -30,9 +30,10 @@ public final class WebSocketRelayTransport: RelayTransport, @unchecked Sendable 
     public func open() async throws -> AsyncStream<TransportSignal> {
         let task = URLSession.shared.webSocketTask(with: url)
         self.task = task
+        task.maximumMessageSize = 1024 * 1024
         task.resume()
-        return AsyncStream { continuation in
-            Task {
+        return AsyncStream(bufferingPolicy: .bufferingNewest(8)) { continuation in
+            let reader = Task {
                 while true {
                     do {
                         switch try await task.receive() {
@@ -52,6 +53,7 @@ public final class WebSocketRelayTransport: RelayTransport, @unchecked Sendable 
                     }
                 }
             }
+            continuation.onTermination = { _ in reader.cancel(); task.cancel(with: .normalClosure, reason: nil) }
         }
     }
 
