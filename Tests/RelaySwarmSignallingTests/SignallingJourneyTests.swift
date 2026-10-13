@@ -13,8 +13,8 @@ final class SignallingJourneyTests: XCTestCase {
         try await originPool.connect()
         try await joinerPool.connect()
 
-        let origin = SwarmSignaller(keys: .generate(), pool: originPool, swarmID: "journey")
-        let joiner = SwarmSignaller(keys: .generate(), pool: joinerPool, swarmID: "journey")
+        let origin = SwarmSignaller(keys: .generate(), pool: originPool, swarmID: "journey-v3")
+        let joiner = SwarmSignaller(keys: .generate(), pool: joinerPool, swarmID: "journey-v3")
 
         // Ephemeral kinds are fan-out only, so every listener subscribes
         // before anything is published.
@@ -27,49 +27,36 @@ final class SignallingJourneyTests: XCTestCase {
         XCTAssertEqual(presence.role, "seeder")
         XCTAssertTrue(presence.encrypted)
 
-        try await joiner.send(type: "offer", sdp: "sdp:joiner-offer", to: presence.peer)
+        try await joiner.send(type: "offer", sdp: "sdp:joiner-offer", to: presence.peer, requestID: "journey-request-123")
         let offer = try await firstElement(of: originSignals)
         XCTAssertEqual(offer.type, "offer")
         XCTAssertEqual(offer.sdp, "sdp:joiner-offer")
 
-        try await origin.send(type: "answer", sdp: "sdp:origin-answer", to: offer.from)
+        try await origin.send(type: "answer", sdp: "sdp:origin-answer", to: offer.from, requestID: offer.requestID)
         let answer = try await firstElement(of: joinerSignals)
         XCTAssertEqual(answer.type, "answer")
         XCTAssertEqual(answer.sdp, "sdp:origin-answer")
+        XCTAssertEqual(answer.requestID, offer.requestID)
+        XCTAssertEqual(answer.transport, "webrtc")
 
-        // What the relay actually saw: version-tagged signal events whose
+        // What the relay actually saw: encrypted signal events whose
         // content carries no SDP and no JSON structure in the clear.
         let signalEvents = await relay.capturedEvents().filter { $0.kind == SwarmWire.signalKind }
         XCTAssertEqual(signalEvents.count, 2)
         for event in signalEvents {
-            XCTAssertEqual(event.tagValue(SwarmWire.versionTag), SwarmWire.encryptedVersion)
+            XCTAssertNil(event.tagValue("v"))
             XCTAssertFalse(event.content.contains("sdp"))
             XCTAssertFalse(event.content.contains("{"))
         }
     }
 
-    func testPlaintextLegacySignalStillParses() async throws {
-        let relay = SimulatedRelay()
-        let ourPool = RelayPool(connections: [RelayConnection(transport: relay.makeTransport())])
-        try await ourPool.connect()
-        let us = SwarmSignaller(keys: .generate(), pool: ourPool, swarmID: "legacy")
-        let ourSignals = await us.signals()
-
-        // A proof-of-concept peer: plaintext JSON content, no version tag.
-        let legacyKeys = NostrKeys.generate()
-        let legacyConnection = RelayConnection(transport: relay.makeTransport())
-        try await legacyConnection.connect()
-        let event = try NostrEvent.signed(
-            kind: SwarmWire.signalKind,
-            tags: [[SwarmWire.swarmTag, "legacy"], ["p", await us.publicKey]],
-            content: "{\"type\":\"offer\",\"sdp\":\"sdp:plain\"}",
-            keys: legacyKeys)
-        try await legacyConnection.publish(event)
-
-        let signal = try await firstElement(of: ourSignals)
-        XCTAssertEqual(signal.type, "offer")
-        XCTAssertEqual(signal.sdp, "sdp:plain")
-        XCTAssertEqual(signal.from, legacyKeys.publicKey)
+    func testPlaintextLegacySignalIsRejected() async throws {
+        let keys = NostrKeys.generate(), sender = NostrKeys.generate()
+        let us = SwarmSignaller(keys: keys, pool: RelayPool(connections: []), swarmID: "legacy-v3")
+        let event = try NostrEvent.signed(kind: 24171, tags: [["x", "legacy-v3"], ["p", keys.publicKey]],
+            content: "{\"type\":\"offer\",\"sdp\":\"plain\"}", keys: sender)
+        let signal = await us.decodeSignal(event)
+        XCTAssertNil(signal)
     }
 
     func testPoolDeduplicatesAcrossRelays() async throws {

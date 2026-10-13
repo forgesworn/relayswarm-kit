@@ -2,7 +2,7 @@ import Foundation
 import RelaySwarmSignalling
 
 /// The origin side of a watch session: announce the swarm, answer every
-/// viewer's encrypted offer, and hold the open channels for broadcasting.
+/// admitted viewer's encrypted offer, and hold bounded channels for broadcasting.
 ///
 /// Deliberately rendezvous-plus-pipe and nothing more. Every viewer gets a
 /// direct channel; nothing schedules segments or asks peers to serve each
@@ -16,6 +16,8 @@ public actor SwarmHost {
     private var channels = [ObjectIdentifier: DataChannel]()
     private var tasks = [Task<Void, Never>]()
     private var lastAnnounce = Date.distantPast
+    private let maxPeers = 16
+    private var admission: @Sendable (String, String?) -> Bool = { _, _ in false }
     private var guestText: (@Sendable (String) -> Void)?
 
     public init(keys: NostrKeys = .generate(), relays: [URL], swarmID: String,
@@ -35,15 +37,16 @@ public actor SwarmHost {
         self.stunServers = stunServers
     }
 
-    public func start() async throws {
+    public func start(admitPeer: @escaping @Sendable (String, String?) -> Bool = { _, _ in false }) async throws {
+        admission = admitPeer
         try await pool.connect()
         let signals = await signaller.signals()
         let presences = await signaller.presences()
 
         tasks.append(Task {
-            for await signal in signals where signal.type == "offer" {
-                guard let sdp = signal.sdp else { continue }
-                self.answer(offerSDP: sdp, viewer: signal.from)
+            for await signal in signals where signal.type == "offer" && signal.transport == "webrtc" {
+                guard self.admission(signal.from, signal.ticket), let sdp = signal.sdp else { continue }
+                self.answer(offerSDP: sdp, viewer: signal.from, requestID: signal.requestID, admissionTicket: signal.ticket)
             }
         })
         // A watcher arriving announces itself, and the origin answers with a
@@ -95,17 +98,18 @@ public actor SwarmHost {
         guard force || Date().timeIntervalSince(lastAnnounce) > 2 else { return }
         if force, Date().timeIntervalSince(lastAnnounce) < 1 { return }
         lastAnnounce = Date()
-        try? await signaller.announcePresence(role: "origin")
+        try? await signaller.announcePresence(role: "seeder", open: peers.count < maxPeers)
     }
 
-    private func answer(offerSDP: String, viewer: String) {
+    private func answer(offerSDP: String, viewer: String, requestID: String, admissionTicket: String?) {
+        guard peers.count < maxPeers, offerSDP.utf8.count <= SwarmWire.maxPlaintextBytes else { return }
         let peer = PeerConnection(stunServers: stunServers)
         let peerKey = ObjectIdentifier(peer)
         peers[peerKey] = peer
 
         peer.onGatheredDescription = { [weak self] sdp, type in
             guard type == .answer, let self else { return }
-            Task { await self.sendAnswer(sdp, to: viewer) }
+            Task { await self.sendAnswer(sdp, to: viewer, requestID: requestID, admissionTicket: admissionTicket) }
         }
         peer.onDataChannel = { [weak self] channel in
             guard let self else { return }
@@ -121,11 +125,13 @@ public actor SwarmHost {
         peer.setRemote(offerSDP, type: .offer)
     }
 
-    private func sendAnswer(_ sdp: String, to viewer: String) async {
-        try? await signaller.send(type: "answer", sdp: sdp, to: viewer)
+    private func sendAnswer(_ sdp: String, to viewer: String, requestID: String, admissionTicket: String?) async {
+        guard admission(viewer, admissionTicket) else { return }
+        try? await signaller.send(type: "answer", sdp: sdp, to: viewer, requestID: requestID)
     }
 
     private func adopt(channel: DataChannel, key: ObjectIdentifier) {
+        guard channels.count < maxPeers else { channel.close(); return }
         channels[key] = channel
         if let guestText { channel.onText = guestText }
     }
@@ -143,12 +149,13 @@ public actor SwarmHost {
 /// The viewer side, for native apps: find the origin, offer, and hand back
 /// the open channel. The browser page does the same in JavaScript.
 public actor SwarmGuest {
-    public enum Failure: Error { case timedOut }
+    public enum Failure: Error { case timedOut, invalidTimeout, admissionDenied, busy }
 
     private let signaller: SwarmSignaller
     private let pool: RelayPool
     private let stunServers: [String]
     private var peer: PeerConnection?
+    private var connecting = false
 
     public init(keys: NostrKeys = .generate(), relays: [URL], swarmID: String,
                 stunServers: [String] = ["stun:stun.l.google.com:19302"]) {
@@ -167,31 +174,43 @@ public actor SwarmGuest {
     }
 
     /// Connect and return the channel once it is open.
-    public func connect(timeoutSeconds: Double = 60) async throws -> DataChannel {
-        try await pool.connect()
-        let signals = await signaller.signals()
-        let presences = await signaller.presences()
-        // Saying "a watcher is here" prompts the origin to re-announce
-        // immediately, so discovery is a round trip rather than a wait.
-        try await signaller.announcePresence(role: "watcher")
+    public func connect(timeoutSeconds: Double = 60, objectKey: String? = nil, ticket: String? = nil, admitPeer: @escaping @Sendable (SwarmPresence) -> Bool = { _ in false }) async throws -> DataChannel {
+        guard timeoutSeconds.isFinite, timeoutSeconds > 0, timeoutSeconds <= 120 else { throw Failure.invalidTimeout }
+        guard !connecting, peer == nil else { throw Failure.busy }
+        connecting = true
+        defer { connecting = false }
+        do {
+            try Task.checkCancellation()
+            try await pool.connect()
+            let signals = await signaller.signals()
+            let presences = await signaller.presences()
+            // Saying "a watcher is here" prompts the origin to re-announce
+            // immediately, so discovery is a round trip rather than a wait.
+            try await signaller.announcePresence(role: "watcher", transports: [], ticket: ticket)
 
-        return try await withThrowingTaskGroup(of: DataChannel?.self) { group in
-            group.addTask {
-                for await presence in presences where presence.role == "origin" {
-                    return try await self.offer(to: presence.peer, signals: signals)
+            return try await withThrowingTaskGroup(of: DataChannel?.self) { group in
+                group.addTask {
+                    for await presence in presences where (presence.role == "seeder" || (presence.role == "viewer" && objectKey.map({ presence.have.contains($0) }) == true)) && presence.transports.contains(where: { $0.type == "webrtc" }) {
+                        guard admitPeer(presence) else { continue }
+                        return try await self.offer(to: presence.peer, signals: signals, ticket: ticket, admission: { admitPeer(presence) })
+                    }
+                    return nil
                 }
-                return nil
-            }
-            group.addTask {
-                try await Task.sleep(for: .seconds(timeoutSeconds))
-                return nil
-            }
-            guard let first = try await group.next(), let channel = first else {
+                group.addTask {
+                    try await Task.sleep(for: .seconds(timeoutSeconds))
+                    return nil
+                }
+                guard let first = try await group.next(), let channel = first else {
+                    group.cancelAll()
+                    throw Failure.timedOut
+                }
                 group.cancelAll()
-                throw Failure.timedOut
+                return channel
             }
-            group.cancelAll()
-            return channel
+        } catch {
+            peer?.close(); peer = nil
+            await pool.close()
+            throw error
         }
     }
 
@@ -201,14 +220,16 @@ public actor SwarmGuest {
         await pool.close()
     }
 
-    private func offer(to origin: String, signals: AsyncStream<SwarmSignal>) async throws -> DataChannel {
+    private func offer(to origin: String, signals: AsyncStream<SwarmSignal>, ticket: String?, admission: @escaping @Sendable () -> Bool) async throws -> DataChannel {
+        guard admission() else { throw Failure.admissionDenied }
         let peer = PeerConnection(stunServers: stunServers)
         self.peer = peer
+        let requestID = UUID().uuidString.replacingOccurrences(of: "-", with: "")
         // Creating the first data channel starts offer gathering. Install
         // the native callback first so a fast local gather cannot disappear.
         peer.onGatheredDescription = { [signaller] sdp, type in
-            guard type == .offer else { return }
-            Task { try? await signaller.send(type: "offer", sdp: sdp, to: origin) }
+            guard type == .offer, admission() else { return }
+            Task { try? await signaller.send(type: "offer", sdp: sdp, to: origin, requestID: requestID, ticket: ticket) }
         }
         let channel = peer.createDataChannel("watch")
 
@@ -216,14 +237,15 @@ public actor SwarmGuest {
             channel.onOpen = { continuation.yield(()); continuation.finish() }
         }
         let answers = Task {
-            for await signal in signals where signal.type == "answer" && signal.from == origin {
-                guard let sdp = signal.sdp else { continue }
+            for await signal in signals where signal.type == "answer" && signal.from == origin && signal.transport == "webrtc" && signal.requestID == requestID {
+                guard admission(), let sdp = signal.sdp else { continue }
                 peer.setRemote(sdp, type: .answer)
                 break
             }
         }
         defer { answers.cancel() }
         for await _ in opened { break }
+        try Task.checkCancellation()
         return channel
     }
 }

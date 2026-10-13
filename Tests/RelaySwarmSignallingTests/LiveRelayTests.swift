@@ -37,11 +37,11 @@ final class LiveRelayTests: XCTestCase {
         let presence = try await firstElement(of: joinerPresences, timeoutSeconds: 15)
         XCTAssertEqual(presence.role, "seeder")
 
-        try await joiner.send(type: "offer", sdp: "live-offer-sdp", to: presence.peer)
+        try await joiner.send(type: "offer", sdp: "live-offer-sdp", to: presence.peer, requestID: "live-request-123")
         let offer = try await firstElement(of: originSignals, timeoutSeconds: 15)
         XCTAssertEqual(offer.sdp, "live-offer-sdp")
 
-        try await origin.send(type: "answer", sdp: "live-answer-sdp", to: offer.from)
+        try await origin.send(type: "answer", sdp: "live-answer-sdp", to: offer.from, requestID: offer.requestID)
         let answer = try await firstElement(of: joinerSignals, timeoutSeconds: 15)
         XCTAssertEqual(answer.sdp, "live-answer-sdp")
 
