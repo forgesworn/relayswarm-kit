@@ -1,5 +1,6 @@
 import Foundation
 import CryptoKit
+import RelaySwarmCore
 import RelaySwarmSignalling
 
 public enum MediaVerificationError: Error, Equatable {
@@ -37,9 +38,9 @@ func localPath(_ value: String) -> Bool {
     value.utf8.count <= 2048 && value.range(of: "^/media/[a-zA-Z0-9_./-]+$", options: .regularExpression) != nil && !value.split(separator: "/").contains("..")
 }
 func validAuthor(_ event: NostrEvent) -> Bool {
-    bounded(event) && event.kind == 30311 && event.isValid && one(event, "d") != nil
-        && event.tags.filter({ $0.first == "relayswarm" }).count == 1
-        && event.tags.contains(["relayswarm", "redistribute", "1"])
+    guard bounded(event), event.tags.filter({ $0.first == "relayswarm" }).count == 1,
+          let bytes = try? JSONEncoder().encode(event) else { return false }
+    return RelaySwarmCore.validStreamAuthorisation(eventJson: String(decoding: bytes, as: UTF8.self))
 }
 public struct MediaEncryption: Codable, Sendable, Equatable {
     public let method: String, keyPath: String, iv: String, keyFormat: String
@@ -83,25 +84,37 @@ public struct VerifiedMediaCommitment: Sendable, Equatable {
     public let domain: String, v: Int, streamEventId: String, swarmId: String, key: String, rendition: String
     public let sequence: Int, discontinuity: Int, part: Int?, sha256: String, size: Int, expiresAt: Int
     public let playlist: String?, mediaType: String?, encryption: MediaEncryption?
+    public let pieceSize: Int?, pieces: [String]?
+    init(domain: String, v: Int, streamEventId: String, swarmId: String, key: String, rendition: String,
+         sequence: Int, discontinuity: Int, part: Int?, sha256: String, size: Int, expiresAt: Int,
+         playlist: String?, mediaType: String?, encryption: MediaEncryption?, pieceSize: Int? = nil, pieces: [String]? = nil) {
+        self.domain = domain; self.v = v; self.streamEventId = streamEventId; self.swarmId = swarmId
+        self.key = key; self.rendition = rendition; self.sequence = sequence; self.discontinuity = discontinuity
+        self.part = part; self.sha256 = sha256; self.size = size; self.expiresAt = expiresAt
+        self.playlist = playlist; self.mediaType = mediaType; self.encryption = encryption
+        self.pieceSize = pieceSize; self.pieces = pieces
+    }
     var canonical: String {
         var pairs = ["\"domain\":\(quoted(domain))", "\"v\":\(v)", "\"streamEventId\":\(quoted(streamEventId))", "\"swarmId\":\(quoted(swarmId))",
                      "\"key\":\(quoted(key))", "\"rendition\":\(quoted(rendition))", "\"sequence\":\(sequence)", "\"discontinuity\":\(discontinuity)",
                      "\"part\":\(part.map(String.init) ?? "null")", "\"sha256\":\(quoted(sha256))", "\"size\":\(size)", "\"expiresAt\":\(expiresAt)"]
-        if v == 2 { pairs += ["\"playlist\":\(quoted(playlist ?? ""))", "\"mediaType\":\(quoted(mediaType ?? ""))", "\"encryption\":\(encryption?.canonical ?? "null")"] }
+        if v >= 2 { pairs += ["\"playlist\":\(quoted(playlist ?? ""))", "\"mediaType\":\(quoted(mediaType ?? ""))", "\"encryption\":\(encryption?.canonical ?? "null")"] }
+        if v == 3 { pairs += ["\"pieceSize\":\(pieceSize ?? 0)", "\"pieces\":[\((pieces ?? []).map(quoted).joined(separator: ","))]"] }
         return "{" + pairs.joined(separator: ",") + "}"
     }
     public func verifyBytes(_ bytes: Data) throws {
         guard bytes.count == size, mediaSHA256(bytes) == sha256 else { throw MediaVerificationError.integrity }
     }
 }
-private struct CommitmentDocument: Decodable {
+struct CommitmentDocument: Decodable {
     let domain: String, v: Int, streamEventId: String, swarmId: String, key: String, rendition: String
     let sequence: Int, discontinuity: Int, part: Int?, sha256: String, size: Int, expiresAt: Int
     let playlist: String?, mediaType: String?, encryption: MediaEncryption?
+    let pieceSize: Int?, pieces: [String]?
     var value: VerifiedMediaCommitment {
         .init(domain: domain, v: v, streamEventId: streamEventId, swarmId: swarmId, key: key, rendition: rendition,
               sequence: sequence, discontinuity: discontinuity, part: part, sha256: sha256, size: size, expiresAt: expiresAt,
-              playlist: playlist, mediaType: mediaType, encryption: encryption)
+              playlist: playlist, mediaType: mediaType, encryption: encryption, pieceSize: pieceSize, pieces: pieces)
     }
 }
 struct Delegation: Codable {
@@ -114,29 +127,6 @@ struct Delegation: Codable {
 struct Revocation: Codable {
     let domain: String, v: Int, streamEventId: String, swarmId: String, delegationId: String
     var canonical: String { "{\"domain\":\(quoted(domain)),\"v\":\(v),\"streamEventId\":\(quoted(streamEventId)),\"swarmId\":\(quoted(swarmId)),\"delegationId\":\(quoted(delegationId))}" }
-}
-private func delegationScope(_ event: NostrEvent?, trust: MediaTrust, at: Int) throws -> Delegation {
-    guard let event, bounded(event), event.kind == 24173, event.pubkey == trust.streamEvent.pubkey, event.isValid,
-          event.createdAt >= 0, event.createdAt <= safeInteger - 3600, event.createdAt <= at + 30,
-          one(event, "x") == trust.swarmID, one(event, "e") == trust.streamEvent.id,
-          let scope = try? JSONDecoder().decode(Delegation.self, from: Data(event.content.utf8)), event.content == scope.canonical,
-          scope.domain == "relayswarm-commitment-delegation-v1", scope.v == 1, scope.streamEventId == trust.streamEvent.id, scope.swarmId == trust.swarmID,
-          hex64(scope.delegatePubkey), scope.notBefore >= event.createdAt, scope.notBefore <= at, scope.expiresAt > at,
-          scope.expiresAt > scope.notBefore, scope.expiresAt <= event.createdAt + 3600,
-          !scope.renditions.isEmpty, scope.renditions.count <= 40, Set(scope.renditions).count == scope.renditions.count,
-          scope.renditions.allSatisfy({ localPath($0) || $0.range(of: "^(?:0|[1-9][0-9]{0,3})$", options: .regularExpression) != nil }),
-          !scope.mediaTypes.isEmpty, scope.mediaTypes.count <= 2, Set(scope.mediaTypes).count == scope.mediaTypes.count,
-          scope.mediaTypes.allSatisfy({ ["main", "audio"].contains($0) }), scope.maxSegmentBytes >= 1, scope.maxSegmentBytes <= 16 * 1024 * 1024 else { throw MediaVerificationError.invalidDelegation }
-    if trust.revokedDelegationIDs.contains(event.id) { throw MediaVerificationError.revoked }
-    for revoked in trust.revocations {
-        guard revoked.kind == 24174, revoked.pubkey == trust.streamEvent.pubkey, revoked.createdAt >= event.createdAt, revoked.createdAt <= at + 30,
-              revoked.isValid, one(revoked, "x") == trust.swarmID, one(revoked, "e") == event.id,
-              let value = try? JSONDecoder().decode(Revocation.self, from: Data(revoked.content.utf8)), revoked.content == value.canonical,
-              value.domain == "relayswarm-commitment-revocation-v1", value.v == 1, value.streamEventId == trust.streamEvent.id,
-              value.swarmId == trust.swarmID, value.delegationId == event.id else { continue }
-        throw MediaVerificationError.revoked
-    }
-    return scope
 }
 public func mediaSHA256(_ bytes: Data) -> String { SHA256.hash(data: bytes).map { String(format: "%02x", $0) }.joined() }
 /// Canonicalisation and endpoint trust remain explicit application decisions.
@@ -151,29 +141,46 @@ public func mediaObjectKey(swarmID: String, canonicalURI: String, rangeStart: In
     }
     return mediaSHA256(Data("\(swarmID)\n\(canonicalURI)\(range)".utf8))
 }
+/// The application's trusted-author gate remains in MediaTrust; the released
+/// Rust core owns commitment, delegation, revocation and context verification.
 public func verifySegmentCommitment(_ event: NostrEvent, context: MediaContext, trust: MediaTrust,
                                     at: Int = Int(Date().timeIntervalSince1970)) throws -> VerifiedMediaCommitment {
     guard at >= 0, at <= safeInteger - 3600 else { throw MediaVerificationError.invalidPolicy }
-    guard bounded(event), event.kind == 24172, event.createdAt >= at - 120, event.createdAt <= at + 30, event.isValid,
-          one(event, "x") == trust.swarmID, one(event, "e") == trust.streamEvent.id,
-          let value = try? JSONDecoder().decode(CommitmentDocument.self, from: Data(event.content.utf8)).value, event.content == value.canonical,
-          [1, 2].contains(value.v), value.domain == "relayswarm-segment-v\(value.v)", value.streamEventId == trust.streamEvent.id,
-          value.swarmId == trust.swarmID, value.key == context.key, value.sequence == context.sequence, value.discontinuity == context.discontinuity,
-          value.part == context.part, value.sequence >= 0, value.sequence <= safeInteger, value.discontinuity >= 0, value.discontinuity <= safeInteger,
-          value.part.map({ $0 >= 0 && $0 <= safeInteger }) ?? true, hex64(value.sha256), value.size >= 1, value.size <= context.maxSegmentBytes,
-          value.expiresAt <= safeInteger, value.expiresAt <= at + 300 else { throw MediaVerificationError.invalidCommitment }
-    guard value.expiresAt > at else { throw MediaVerificationError.expired }
-    if value.v == 2 {
-        guard let playlist = context.playlist, value.playlist == playlist, value.rendition == playlist, value.mediaType == context.mediaType,
-              value.encryption == context.encryption else { throw MediaVerificationError.invalidContext }
-    } else {
-        guard value.rendition == String(context.level), context.mediaType == "main", context.encryption == nil else { throw MediaVerificationError.invalidContext }
+    guard bounded(event) else { throw MediaVerificationError.invalidCommitment }
+    let eventJSON = String(decoding: try JSONEncoder().encode(event), as: UTF8.self)
+    let options = try coreVerificationOptions(context, trust)
+    let optionsJSON = String(decoding: try JSONSerialization.data(withJSONObject: options, options: [.sortedKeys]), as: UTF8.self)
+    guard let result = RelaySwarmCore.verifySegmentCommitment(eventJson: eventJSON, optionsJson: optionsJSON, atMs: Int64(at) * 1000),
+          let document = try? JSONDecoder().decode(CommitmentDocument.self, from: Data(result.utf8)) else {
+        // Preserve public error categories without a second accepting verifier.
+        if let document = try? JSONDecoder().decode(CommitmentDocument.self, from: Data(event.content.utf8)), document.expiresAt <= at {
+            throw MediaVerificationError.expired
+        }
+        if event.pubkey != trust.streamEvent.pubkey, let delegation = trust.delegation {
+            let delegationJSON = String(decoding: try JSONEncoder().encode(delegation), as: UTF8.self)
+            var unrevoked = options; unrevoked["revokedDelegationIds"] = [String](); unrevoked["delegationRevocations"] = [Any]()
+            let unrevokedJSON = String(decoding: try JSONSerialization.data(withJSONObject: unrevoked, options: [.sortedKeys]), as: UTF8.self)
+            if RelaySwarmCore.verifyCommitmentDelegation(eventJson: delegationJSON, optionsJson: unrevokedJSON, atMs: Int64(at) * 1000) != nil,
+               RelaySwarmCore.verifyCommitmentDelegation(eventJson: delegationJSON, optionsJson: optionsJSON, atMs: Int64(at) * 1000) == nil {
+                throw MediaVerificationError.revoked
+            }
+            throw MediaVerificationError.invalidDelegation
+        }
+        throw MediaVerificationError.invalidCommitment
     }
-    if event.pubkey != trust.streamEvent.pubkey {
-        let scope = try delegationScope(trust.delegation, trust: trust, at: at)
-        guard event.pubkey == scope.delegatePubkey, one(event, "delegation") == trust.delegation?.id, event.createdAt >= scope.notBefore,
-              value.expiresAt <= scope.expiresAt, scope.renditions.contains(value.rendition), scope.mediaTypes.contains(value.v == 2 ? value.mediaType! : "main"),
-              value.part == nil || scope.allowParts, value.size <= scope.maxSegmentBytes else { throw MediaVerificationError.invalidDelegation }
-    }
-    return value
+    return document.value
+}
+
+func coreVerificationOptions(_ context: MediaContext, _ trust: MediaTrust) throws -> [String: Any] {
+    func object(_ event: NostrEvent) throws -> Any { try JSONSerialization.jsonObject(with: JSONEncoder().encode(event)) }
+    let encryption: Any = context.encryption.map { ["method": $0.method, "keyPath": $0.keyPath, "iv": $0.iv, "keyFormat": $0.keyFormat] } ?? NSNull()
+    let media: Any = context.playlist.map { ["playlist": $0, "mediaType": context.mediaType, "encryption": encryption] } ?? NSNull()
+    var options: [String: Any] = ["streamEvent": try object(trust.streamEvent), "swarmId": trust.swarmID, "key": context.key,
+        "maxSegmentBytes": context.maxSegmentBytes, "revokedDelegationIds": Array(trust.revokedDelegationIDs),
+        "delegationRevocations": try trust.revocations.map(object),
+        "context": ["sequence": context.sequence, "discontinuity": context.discontinuity, "part": context.part.map { $0 as Any } ?? NSNull(),
+                    "level": String(context.level), "fragType": context.mediaType,
+                    "decryptMethod": context.encryption.map { $0.method as Any } ?? NSNull(), "media": media]]
+    if let delegation = trust.delegation { options["delegation"] = try object(delegation) }
+    return options
 }

@@ -2,11 +2,13 @@ import Foundation
 import RelaySwarmSignalling
 import RelaySwarmTransport
 import RelaySwarmMedia
+import RelaySwarmCore
 
 // Application-owned acceptance fixture. All wire decoding, signatures,
 // delegation checks and peer framing use the public current SDK products.
 struct Expected: Codable { let path: String, playlist: String, mediaType: String; let level: Int, sequence: Int, discontinuity: Int }
 struct Configuration: Codable {
+    let pieceMode: Bool?, peerPubkeys: [String]?
     let scenario: String, relayUrl: String, swarmId: String, peerPubkey: String, trustedAuthor: String, commitmentUrl: String, policyUrl: String?
     let streamEvent: NostrEvent, delegation: NostrEvent?, revocations: [NostrEvent]?, expected: Expected
 }
@@ -31,7 +33,8 @@ func fetchedEvent(_ url: String) async throws -> NostrEvent {
         guard CommandLine.arguments.count == 2 else { fatalError("One explicitly owned fixture configuration is required") }
         let config = try JSONDecoder().decode(Configuration.self, from: Data(contentsOf: URL(fileURLWithPath: CommandLine.arguments[1])))
         let keys = NostrKeys.generate()
-        var guest: SwarmGuest?, polling: Task<Void, Never>?
+        var guests = [SwarmGuest](), mediaPeers = [CoreMediaPeer]()
+        var polling: Task<Void, Never>?
         var transferred = 0
         do {
             let key = try mediaObjectKey(swarmID: config.swarmId, canonicalURI: config.expected.path)
@@ -40,7 +43,7 @@ func fetchedEvent(_ url: String) async throws -> NostrEvent {
             let trust = try MediaTrust(streamEvent: config.streamEvent, trustedAuthors: [config.trustedAuthor], swarmID: config.swarmId,
                 delegation: config.delegation, revocations: config.revocations ?? [])
             let current = CurrentTrust(trust), event = try await fetchedEvent(config.commitmentUrl)
-            _ = try verifySegmentCommitment(event, context: context, trust: current.current())
+            let verified = try verifySegmentCommitment(event, context: context, trust: current.current())
             if let policyURL = config.policyUrl {
                 polling = Task {
                     while !Task.isCancelled {
@@ -55,20 +58,52 @@ func fetchedEvent(_ url: String) async throws -> NostrEvent {
                     }
                 }
             }
-            let client = SwarmGuest(keys: keys, relays: [URL(string: config.relayUrl)!], swarmID: config.swarmId, stunServers: [])
-            guest = client
-            let channel = try await client.connect(timeoutSeconds: 15, objectKey: key, ticket: "fixture-admission", admitPeer: { $0.peer == config.peerPubkey })
-            emit(["type": "sdk-connected", "pubkey": keys.publicKey, "wireVersion": 3])
-            let mediaChannel = MediaDataChannel(channel)
-            let bytes = try await SignedMediaTransfer.receive(from: mediaChannel, event: event, context: context, trustProvider: { current.current() }, timeoutMilliseconds: 5000)
-            transferred = bytes.count
-            emit(["type": "sdk-receipt", "scenario": config.scenario, "ok": true, "objectBytes": bytes.count, "sha256": mediaSHA256(bytes),
-                  "wireVersion": 3, "commitmentSchema": 2, "sdkAPI": "SwarmGuest + MediaDataChannel + SignedMediaTransfer", "wireAdapter": false])
-            mediaChannel.close()
+            if config.pieceMode == true {
+                for peer in config.peerPubkeys ?? [config.peerPubkey] {
+                    let client = SwarmGuest(keys: .generate(), relays: [URL(string: config.relayUrl)!], swarmID: config.swarmId, stunServers: [])
+                    guests.append(client)
+                    let channel = try await client.connect(timeoutSeconds: 15, objectKey: key, objectFraming: 2,
+                        ticket: "fixture-admission", admitPeer: { $0.peer == peer })
+                    mediaPeers.append(try CoreMediaPeer(channel: MediaDataChannel(channel)))
+                }
+                // Controlled planner inputs for a protocol fixture, not a measured rate.
+                let sources = mediaPeers.map { MediaPieceSource(peer: $0, timing: Timing(firstByteMs: 1000, rate: 1024)) }
+                let result = try await SignedPieceTransfer.receive(from: sources, event: event, context: context,
+                    trustProvider: { current.current() }, timeoutMilliseconds: 5000,
+                    origin: { _ in throw MediaTransferError.unavailable })
+                var used = 0
+                for peer in mediaPeers { if await peer.bytesReceived > 0 { used += 1 } }
+                transferred = result.data.count
+                emit(["type": "sdk-receipt", "scenario": config.scenario, "ok": true, "objectBytes": result.data.count,
+                    "sha256": mediaSHA256(result.data), "wireVersion": 3, "commitmentSchema": verified.v, "framing": 2,
+                    "holdersUsed": used, "peerBytes": result.peerBytes, "originBytes": result.originBytes,
+                    "unusedBytes": result.unusedBytes, "fixtureTimingEstimates": true,
+                    "sdkAPI": "SwarmGuest + CoreMediaPeer + SignedPieceTransfer", "wireAdapter": false])
+            } else {
+                let client = SwarmGuest(keys: keys, relays: [URL(string: config.relayUrl)!], swarmID: config.swarmId, stunServers: [])
+                guests.append(client)
+                let channel = try await client.connect(timeoutSeconds: 15, objectKey: key, ticket: "fixture-admission", admitPeer: { $0.peer == config.peerPubkey })
+                emit(["type": "sdk-connected", "pubkey": keys.publicKey, "wireVersion": 3])
+                let mediaChannel = MediaDataChannel(channel)
+                let bytes = try await SignedMediaTransfer.receive(from: mediaChannel, event: event, context: context, trustProvider: { current.current() }, timeoutMilliseconds: 5000)
+                transferred = bytes.count
+                emit(["type": "sdk-receipt", "scenario": config.scenario, "ok": true, "objectBytes": bytes.count, "sha256": mediaSHA256(bytes),
+                    "wireVersion": 3, "commitmentSchema": verified.v, "sdkAPI": "SwarmGuest + MediaDataChannel + SignedMediaTransfer", "wireAdapter": false])
+                mediaChannel.close()
+            }
         } catch {
-            emit(["type": "sdk-receipt", "scenario": config.scenario, "ok": false, "error": String(describing: error), "objectBytes": transferred,
-                  "wireVersion": 3, "sdkAPI": "SwarmGuest + MediaDataChannel + SignedMediaTransfer", "wireAdapter": false])
+            var reports = [[String: Any]]()
+            for peer in mediaPeers {
+                for report in await peer.requestReports {
+                    reports.append(["outcome": String(describing: report.outcome), "receivedBytes": report.receivedBytes,
+                        "metadataReceived": report.metadataReceived, "closeReason": report.closeReason ?? ""])
+                }
+            }
+            emit(["coreReports": reports,"type": "sdk-receipt", "scenario": config.scenario, "ok": false, "error": String(describing: error), "objectBytes": transferred,
+                  "wireVersion": 3, "sdkAPI": config.pieceMode == true ? "SwarmGuest + CoreMediaPeer + SignedPieceTransfer" : "SwarmGuest + MediaDataChannel + SignedMediaTransfer", "wireAdapter": false])
         }
-        polling?.cancel(); await guest?.close()
+        polling?.cancel()
+        for peer in mediaPeers { await peer.close() }
+        for guest in guests { await guest.close() }
     }
 }
