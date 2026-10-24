@@ -88,15 +88,19 @@ final class MediaTransferTests: XCTestCase {
     }
     func testDeadlineAndCallerCancellationCloseAnUntaggedResponseChannel() async throws {
         let fixture = MediaFixture(), trust = try fixture.trust(), event = try fixture.commitment()
-        let stalled = TestMediaChannel()
-        do {
-            _ = try await SignedMediaTransfer.receive(from: stalled, event: event, context: fixture.context, trustProvider: { trust }, timeoutMilliseconds: 10, now: { mediaTestTime })
-            XCTFail("Stalled transfer completed")
-        } catch MediaTransferError.timedOut { XCTAssertTrue(stalled.closed) }
+        for timeout in [1, 10, 25] {
+            let stalled = TestMediaChannel()
+            do {
+                _ = try await SignedMediaTransfer.receive(from: stalled, event: event, context: fixture.context, trustProvider: { trust }, timeoutMilliseconds: timeout, now: { mediaTestTime })
+                XCTFail("Stalled transfer completed")
+            } catch MediaTransferError.timedOut { XCTAssertTrue(stalled.closed) }
+        }
         let cancelled = TestMediaChannel()
+        let requested = expectation(description: "request active before caller cancellation")
+        cancelled.script = { _ in requested.fulfill(); return [] }
         let task = Task { try await SignedMediaTransfer.receive(from: cancelled, event: event, context: fixture.context, trustProvider: { trust }, now: { mediaTestTime }) }
-        try await Task.sleep(for: .milliseconds(10)); task.cancel()
-        do { _ = try await task.value; XCTFail("Cancelled transfer completed") } catch { XCTAssertTrue(cancelled.closed) }
+        await fulfillment(of: [requested], timeout: 1); task.cancel()
+        do { _ = try await task.value; XCTFail("Cancelled transfer completed") } catch is CancellationError { XCTAssertTrue(cancelled.closed) }
     }
 }
 private final class ClockBox: @unchecked Sendable {
