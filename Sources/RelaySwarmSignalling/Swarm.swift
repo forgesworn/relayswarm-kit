@@ -25,15 +25,29 @@ public enum SwarmWire {
         let found = event.tags.filter { $0.first == name }
         return found.count == 1 && found[0].count == 2 ? found[0][1] : nil
     }
-    static func fresh(_ event: NostrEvent) -> Bool {
-        let now = Int64(Date().timeIntervalSince1970)
+    static func fresh(_ event: NostrEvent, at now: Int64 = Int64(Date().timeIntervalSince1970)) -> Bool {
         return event.createdAt >= now - 120 && event.createdAt <= now + 30
     }
 }
 public struct SwarmTransportCapability: Sendable, Equatable, Codable {
     public let type: String
     public let publicKey: String
-    public init(type: String, publicKey: String) { self.type = type; self.publicKey = publicKey }
+    /// 2 advertises schema-3 piece ranges; absent/unknown capabilities remain 1.
+    public let objectFraming: Int
+    public init(type: String, publicKey: String, objectFraming: Int = 1) {
+        self.type = type; self.publicKey = publicKey; self.objectFraming = objectFraming
+    }
+    enum CodingKeys: String, CodingKey { case type, publicKey; case objectFraming = "obj" }
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        type = try container.decode(String.self, forKey: .type); publicKey = try container.decode(String.self, forKey: .publicKey)
+        objectFraming = (try? container.decode(Int.self, forKey: .objectFraming)) == 2 ? 2 : 1
+    }
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(type, forKey: .type); try container.encode(publicKey, forKey: .publicKey)
+        if objectFraming == 2 { try container.encode(2, forKey: .objectFraming) }
+    }
 }
 public struct SwarmPresence: Sendable, Equatable {
     public let peer: String, role: String
@@ -49,8 +63,14 @@ public actor SwarmSignaller {
     public enum Failure: Error { case invalidEnvelope, resourceLimit }
     private let keys: NostrKeys, pool: RelayPool, swarmID: String
     private var conversationKeys = [String: Data]()
+    private let clock: @Sendable () -> Int64
     public init(keys: NostrKeys, pool: RelayPool, swarmID: String) {
         self.keys = keys; self.pool = pool; self.swarmID = swarmID
+        clock = { @Sendable in Int64(Date().timeIntervalSince1970) }
+    }
+    // Pin boundary tests without changing the public production clock policy.
+    init(keys: NostrKeys, pool: RelayPool, swarmID: String, clock: @escaping @Sendable () -> Int64) {
+        self.keys = keys; self.pool = pool; self.swarmID = swarmID; self.clock = clock
     }
     public var publicKey: String { keys.publicKey }
     public private(set) var rejectedSignals = 0
@@ -59,9 +79,13 @@ public actor SwarmSignaller {
                                  have: [String] = [], open: Bool? = nil, ticket: String? = nil) async throws {
         let capabilities = transports ?? [.init(type: "webrtc", publicKey: keys.publicKey)]
         guard swarmID.count >= 8, swarmID.count <= 128, SwarmWire.token(role), capabilities.count <= 8,
-              capabilities.allSatisfy({ SwarmWire.token($0.type) && SwarmWire.hex64($0.publicKey) }),
+              capabilities.allSatisfy({ SwarmWire.token($0.type) && SwarmWire.hex64($0.publicKey) && [1, 2].contains($0.objectFraming) }),
               have.count <= 32, have.allSatisfy(SwarmWire.hex64), ticket.map(SwarmWire.ticket) ?? true else { throw Failure.invalidEnvelope }
-        var value: [String: Any] = ["v": 3, "role": role, "transports": capabilities.map { ["type": $0.type, "publicKey": $0.publicKey] }, "have": Array(Set(have)).sorted()]
+        var value: [String: Any] = ["v": 3, "role": role, "transports": capabilities.map { capability -> [String: Any] in
+            var entry: [String: Any] = ["type": capability.type, "publicKey": capability.publicKey]
+            if capability.objectFraming == 2 { entry["obj"] = 2 }
+            return entry
+        }, "have": Array(Set(have)).sorted()]
         if let open { value["open"] = open }; if let ticket { value["ticket"] = ticket }
         let data = try JSONSerialization.data(withJSONObject: value)
         guard data.count <= SwarmWire.maxPresenceBytes else { throw Failure.resourceLimit }
@@ -106,7 +130,7 @@ public actor SwarmSignaller {
         try await pool.publish(NostrEvent.signed(kind: 24171, tags: [["x", swarmID], ["p", peer]], content: ciphertext, keys: keys))
     }
     func decodePresence(_ event: NostrEvent) -> SwarmPresence? {
-        guard event.kind == 24170, event.pubkey != keys.publicKey, event.isValid, SwarmWire.fresh(event),
+        guard event.kind == 24170, event.pubkey != keys.publicKey, event.isValid, SwarmWire.fresh(event, at: clock()),
               SwarmWire.unique(event, "x") == swarmID, !event.tags.contains(where: { $0.first == "p" }),
               event.content.utf8.count <= SwarmWire.maxPresenceBytes,
               let object = try? JSONSerialization.jsonObject(with: Data(event.content.utf8)) as? [String: Any], object["v"] as? Int == 3,
@@ -115,7 +139,7 @@ public actor SwarmSignaller {
         var transports = [SwarmTransportCapability]()
         for entry in entries {
             guard let type = entry["type"] as? String, SwarmWire.token(type), let key = entry["publicKey"] as? String, SwarmWire.hex64(key) else { return nil }
-            transports.append(.init(type: type, publicKey: key))
+            transports.append(.init(type: type, publicKey: key, objectFraming: (entry["obj"] as? Int) == 2 ? 2 : 1))
         }
         let ticket = object["ticket"] as? String
         let advisory = object["open"] as? NSNumber
@@ -123,7 +147,7 @@ public actor SwarmSignaller {
         return .init(peer: event.pubkey, role: role, transports: transports, have: have, open: open, ticket: ticket.flatMap { SwarmWire.ticket($0) ? $0 : nil })
     }
     func decodeSignal(_ event: NostrEvent) -> SwarmSignal? {
-        guard event.kind == 24171, event.pubkey != keys.publicKey, event.isValid, SwarmWire.fresh(event),
+        guard event.kind == 24171, event.pubkey != keys.publicKey, event.isValid, SwarmWire.fresh(event, at: clock()),
               SwarmWire.unique(event, "x") == swarmID, SwarmWire.unique(event, "p") == keys.publicKey,
               event.content.utf8.count <= SwarmWire.maxSignalBytes, let key = try? conversationKey(with: event.pubkey),
               let plaintext = try? NIP44.decrypt(event.content, conversationKey: key), plaintext.utf8.count <= SwarmWire.maxPlaintextBytes,

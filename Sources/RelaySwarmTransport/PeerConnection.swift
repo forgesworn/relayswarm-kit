@@ -207,7 +207,7 @@ public final class DataChannel {
 
     let id: Int32
     private var retained: Unmanaged<DataChannel>?
-    private let lock = NSLock()
+    private let lock = NSCondition()
     private var opened = false
     private var openDelivered = false
     private var closedEarly = false
@@ -218,6 +218,8 @@ public final class DataChannel {
     private let maxPendingFrames = 64
     private let maxPendingBytes = 4 * 1024 * 1024
     private var draining = false
+    private var nativeUsers = 0
+    private var lowHandler: (@Sendable () -> Void)?
 
     public var onOpen: (@Sendable () -> Void)? {
         didSet { replayOpenIfNeeded() }
@@ -234,10 +236,58 @@ public final class DataChannel {
         didSet { replayCloseIfNeeded() }
     }
 
+    /// A real native queue transition, delivered on a libdatachannel thread.
+    /// Marshal work before closing the channel from this callback.
+    public var onBufferedAmountLow: (@Sendable () -> Void)? {
+        get { lock.lock(); defer { lock.unlock() }; return lowHandler }
+        set { lock.lock(); lowHandler = newValue; lock.unlock() }
+    }
+
+    // Keep native deletion behind in-flight API calls without holding the
+    // Swift lock while a native operation or callback runs.
+    private func withNative<T>(_ closedValue: T, _ operation: (Int32) -> T) -> T {
+        lock.lock()
+        guard retained != nil else { lock.unlock(); return closedValue }
+        nativeUsers += 1; lock.unlock()
+        let result = operation(id)
+        lock.lock(); nativeUsers -= 1; lock.broadcast(); lock.unlock()
+        return result
+    }
+
+    /// Only a successful native query can authorise draining an aborted reply.
+    public var reliableOrdered: Bool {
+        withNative(false) { id in
+            var reliability = rtcReliability()
+            return rtcGetDataChannelReliability(id, &reliability) >= 0 && !reliability.unordered && !reliability.unreliable
+        }
+    }
+
+    /// Nil means the channel is closed or the native query failed.
+    public var bufferedAmount: Int? {
+        withNative(nil as Int?) { id in
+            let amount = rtcGetBufferedAmount(id)
+            return amount >= 0 ? Int(amount) : nil
+        }
+    }
+
+    @discardableResult
+    public func setBufferedAmountLowThreshold(_ bytes: Int) -> Bool {
+        guard bytes >= 0, bytes <= Int(Int32.max) else { return false }
+        return withNative(false) { rtcSetBufferedAmountLowThreshold($0, Int32(bytes)) >= 0 }
+    }
+
     init(adopting id: Int32) {
         self.id = id
         retained = Unmanaged.passRetained(self)
         rtcSetUserPointer(id, retained!.toOpaque())
+        rtcSetBufferedAmountLowCallback(id) { _, pointer in
+            guard let pointer else { return }
+            let channel = Unmanaged<DataChannel>.fromOpaque(pointer).takeUnretainedValue()
+            channel.lock.lock()
+            let handler = channel.retained == nil ? nil : channel.lowHandler
+            channel.lock.unlock()
+            handler?()
+        }
         rtcSetOpenCallback(id) { _, pointer in
             guard let pointer else { return }
             Unmanaged<DataChannel>.fromOpaque(pointer).takeUnretainedValue().didOpen()
@@ -345,14 +395,14 @@ public final class DataChannel {
     /// anything larger is refused synchronously; a caller moving more than
     /// this chunks to it.
     public var maxMessageSize: Int {
-        Int(max(rtcMaxMessageSize(id), 0))
+        withNative(0) { Int(max(rtcMaxMessageSize($0), 0)) }
     }
 
     /// Send text; false when the channel is not open or the frame exceeds
     /// maxMessageSize.
     @discardableResult
     public func send(_ text: String) -> Bool {
-        rtcSendMessage(id, text, -1) >= 0
+        withNative(false) { rtcSendMessage($0, text, -1) >= 0 }
     }
 
     /// Send binary; false when the channel is not open or the frame exceeds
@@ -360,17 +410,20 @@ public final class DataChannel {
     /// receiving side - this is bytes, not a null-terminated string.
     @discardableResult
     public func send(_ data: Data) -> Bool {
-        guard !data.isEmpty else { return rtcSendMessage(id, nil, 0) >= 0 }
-        return data.withUnsafeBytes { buffer in
-            rtcSendMessage(id, buffer.baseAddress?.assumingMemoryBound(to: CChar.self),
-                           Int32(buffer.count)) >= 0
+        guard data.count <= Int(Int32.max) else { return false }
+        return withNative(false) { id in
+            guard !data.isEmpty else { return rtcSendMessage(id, nil, 0) >= 0 }
+            return data.withUnsafeBytes { buffer in
+                rtcSendMessage(id, buffer.baseAddress?.assumingMemoryBound(to: CChar.self), Int32(buffer.count)) >= 0
+            }
         }
     }
 
     public func close() {
         lock.lock()
         guard let held = retained else { lock.unlock(); return }
-        retained = nil; pending.removeAll(); pendingBytes = 0
+        retained = nil; lowHandler = nil; pending.removeAll(); pendingBytes = 0
+        while nativeUsers > 0 { lock.wait() }
         lock.unlock()
         rtcDeleteDataChannel(id)
         held.release()

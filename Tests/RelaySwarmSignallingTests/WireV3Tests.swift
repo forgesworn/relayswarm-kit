@@ -25,7 +25,10 @@ final class WireV3Tests: XCTestCase {
         return try NostrEvent.signed(kind: 24171, tags: tags ?? [["x", swarm], ["p", recipient.publicKey]],
             content: NIP44.encrypt(plaintext, conversationKey: key), createdAt: createdAt, keys: sender)
     }
-    func receiver(_ keys: NostrKeys) -> SwarmSignaller { .init(keys: keys, pool: .init(connections: []), swarmID: swarm) }
+    func receiver(_ keys: NostrKeys, at: Int64? = nil) -> SwarmSignaller {
+        if let at { return .init(keys: keys, pool: .init(connections: []), swarmID: swarm, clock: { at }) }
+        return .init(keys: keys, pool: .init(connections: []), swarmID: swarm)
+    }
     func testNestedV3EnvelopePreservesTransportAndRequestID() async throws {
         let sender = NostrKeys.generate(), recipient = NostrKeys.generate(), us = receiver(recipient)
         let event = try encrypted(sender, to: recipient, plaintext: "{\"v\":3,\"type\":\"offer\",\"transport\":\"webrtc\",\"requestId\":\"independent-request\",\"payload\":{\"sdp\":\"offer-sdp\",\"ticket\":\"host-ticket\"}}")
@@ -43,9 +46,10 @@ final class WireV3Tests: XCTestCase {
         let second = await us.decodeSignal(v2); XCTAssertNil(second)
     }
     func testDuplicateTagsReplayAndMalformedEnvelopesAreRejected() async throws {
-        let sender = NostrKeys.generate(), recipient = NostrKeys.generate(), us = receiver(recipient)
+        let now = Int64(Date().timeIntervalSince1970)
+        let sender = NostrKeys.generate(), recipient = NostrKeys.generate(), us = receiver(recipient, at: now)
         let good = "{\"v\":3,\"type\":\"offer\",\"transport\":\"webrtc\",\"requestId\":\"request-123\",\"payload\":{\"sdp\":\"offer\"}}"
-        let normal = [["x", swarm], ["p", recipient.publicKey]], now = Int64(Date().timeIntervalSince1970)
+        let normal = [["x", swarm], ["p", recipient.publicKey]]
         for tags in [normal + [["x", swarm]], normal + [["p", recipient.publicKey]], [["x", "other-swarm"], ["p", recipient.publicKey]]] {
             let value = await us.decodeSignal(try encrypted(sender, to: recipient, plaintext: good, tags: tags)); XCTAssertNil(value)
         }
@@ -56,6 +60,25 @@ final class WireV3Tests: XCTestCase {
             let value = await us.decodeSignal(try encrypted(sender, to: recipient, plaintext: malformed)); XCTAssertNil(value)
         }
     }
+    func testPieceRangeCapabilitiesAreAdditiveAndUnknownValuesStayLegacy() async throws {
+        let sender = NostrKeys.generate(), recipient = NostrKeys.generate(), us = receiver(recipient)
+        for framing in [nil, 2, 3] as [Int?] {
+            var capability: [String: Any] = ["type": "webrtc", "publicKey": sender.publicKey]
+            if let framing { capability["obj"] = framing }
+            let data = try JSONSerialization.data(withJSONObject: capability)
+            let decoded = try JSONDecoder().decode(SwarmTransportCapability.self, from: data)
+            XCTAssertEqual(decoded.objectFraming, framing == 2 ? 2 : 1)
+            let event = try NostrEvent.signed(kind: 24170, tags: [["x", swarm]],
+                content: String(decoding: JSONSerialization.data(withJSONObject: ["v": 3, "role": "viewer", "have": [], "transports": [capability]]), as: UTF8.self), keys: sender)
+            let presence = await us.decodePresence(event)
+            XCTAssertEqual(presence?.transports.first?.objectFraming, framing == 2 ? 2 : 1)
+        }
+        let encoded = try JSONSerialization.jsonObject(with: JSONEncoder().encode(SwarmTransportCapability(type: "webrtc", publicKey: sender.publicKey, objectFraming: 2))) as! [String: Any]
+        XCTAssertEqual(encoded["obj"] as? Int, 2)
+        let legacy = try JSONSerialization.jsonObject(with: JSONEncoder().encode(SwarmTransportCapability(type: "webrtc", publicKey: sender.publicKey))) as! [String: Any]
+        XCTAssertNil(legacy["obj"])
+    }
+
     func testPresenceRequiresV3DescriptorsAndBoundsAdvisoryFields() async throws {
         let sender = NostrKeys.generate(), recipient = NostrKeys.generate(), us = receiver(recipient)
         func presence(_ value: [String: Any]) throws -> NostrEvent {

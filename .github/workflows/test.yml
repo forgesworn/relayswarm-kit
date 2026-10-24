@@ -10,8 +10,10 @@ jobs:
     # to Swift 5.10, which cannot resolve swift-secp256k1 (tools 6.0).
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       - name: Verify bundled data channel
         run: scripts/verify-xcframework.sh
+      - name: Verify released core bindings and fixtures
+        run: scripts/verify-core-bindings.sh
       - name: Run tests
-        run: swift test
+        run: swift test --jobs 4

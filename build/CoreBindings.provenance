@@ -1,0 +1,8 @@
+format=1
+relayswarm_release=v0.3.0
+relayswarm_commit=a3b45cac19dcfbf4e4794b971ba6978852754d2c
+uniffi_version=0.29.5
+xcframework_sha256=bc57bcf2b7566bc675af816f9e63c64332354d3cebdb43eb7b2d723d84498f2c
+bindings_archive_sha256=1d37c214b2da7637b28c100a6d72802786a006ef654fcb24c8baeb12176f5137
+bindings_source=relayswarm-core-swift-bindings.zip:Sources/RelaySwarmCore/relayswarm_ffi.swift
+fixtures_source=core/vectors/commitments.json,core/vectors/link-traces.json

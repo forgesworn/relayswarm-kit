@@ -174,8 +174,8 @@ public actor SwarmGuest {
     }
 
     /// Connect and return the channel once it is open.
-    public func connect(timeoutSeconds: Double = 60, objectKey: String? = nil, ticket: String? = nil, admitPeer: @escaping @Sendable (SwarmPresence) -> Bool = { _ in false }) async throws -> DataChannel {
-        guard timeoutSeconds.isFinite, timeoutSeconds > 0, timeoutSeconds <= 120 else { throw Failure.invalidTimeout }
+    public func connect(timeoutSeconds: Double = 60, objectKey: String? = nil, objectFraming: Int = 1, ticket: String? = nil, admitPeer: @escaping @Sendable (SwarmPresence) -> Bool = { _ in false }) async throws -> DataChannel {
+        guard [1, 2].contains(objectFraming), timeoutSeconds.isFinite, timeoutSeconds > 0, timeoutSeconds <= 120 else { throw Failure.invalidTimeout }
         guard !connecting, peer == nil else { throw Failure.busy }
         connecting = true
         defer { connecting = false }
@@ -190,7 +190,7 @@ public actor SwarmGuest {
 
             return try await withThrowingTaskGroup(of: DataChannel?.self) { group in
                 group.addTask {
-                    for await presence in presences where (presence.role == "seeder" || (presence.role == "viewer" && objectKey.map({ presence.have.contains($0) }) == true)) && presence.transports.contains(where: { $0.type == "webrtc" }) {
+                    for await presence in presences where (presence.role == "seeder" || (presence.role == "viewer" && objectKey.map({ presence.have.contains($0) }) == true)) && presence.transports.contains(where: { $0.type == "webrtc" && (objectFraming == 1 || $0.objectFraming == 2) }) {
                         guard admitPeer(presence) else { continue }
                         return try await self.offer(to: presence.peer, signals: signals, ticket: ticket, admission: { admitPeer(presence) })
                     }

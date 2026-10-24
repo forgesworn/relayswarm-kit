@@ -6,16 +6,24 @@ uses Nostr relays for rendezvous and pairwise NIP-44 for every signal. The
 transport product opens WebRTC data channels using libdatachannel.
 
 `RelaySwarmMedia` verifies application-authorised segment commitments and
-receives bounded, hash-verified media from RelaySwarm browser peers. It does
+receives bounded, hash-verified media from RelaySwarm browser peers. Current
+source uses the published Rust core for verification and framing, and adds
+explicit schema-3 piece assembly and opt-in serving. It does
 not provide a player, choose an origin, fetch encryption keys, infer trusted
-authors or enable uploads.
+authors or automatically enable uploads.
+
+This repository publishes libraries. It does not require a ForgeSworn-hosted
+origin, signalling relay or managed backend. Applications choose their own
+sources, relays and network policy. Automated acceptance fixtures bind temporary
+servers to loopback and close them after the run; no public pilot is required.
 
 ## Products
 
 | Product | Responsibility |
 | --- | --- |
 | `RelaySwarmSignalling` | Signed Nostr events, NIP-44 and strict session v3 presence/signals |
-| `RelaySwarmMedia` | Commitment schemas 1/2, scoped delegation/revocation and bounded receive-only framing |
+| `RelaySwarmMedia` | Core-backed schemas 1/2/3, whole-object reception and explicit piece transfer/serving |
+| `RelaySwarmCore` | Released Rust verifier, link, scheduler, selection and discovery bindings |
 | `RelaySwarmTransport` | libdatachannel, explicitly admitted host/guest connections, `MediaDataChannel` |
 | `RelaySwarmTestSupport` | In-process relay for application tests |
 
@@ -23,7 +31,10 @@ The signalling/media products target macOS 14+ and iOS 16+. The checked-in
 transport binary contains **macOS arm64 only**. This does not establish iOS,
 Intel, physical-device or public-NAT interoperability. Binary source,
 dependency and checksums are recorded in `build/DataChannel.provenance`;
-CI verifies the archive and each object's deployment target.
+CI verifies the archive and each object's deployment target. The core binary
+comes from [RelaySwarm v0.3.0](https://github.com/forgesworn/relayswarm/releases/tag/v0.3.0)
+by immutable URL and SwiftPM checksum; its generated wrapper is retained
+byte-for-byte with provenance. See [core integration](docs/core-integration.md).
 
 ## Session migration
 
@@ -94,6 +105,7 @@ application owns bounded origin fallback and any playback scheduling.
 
 ```sh
 scripts/verify-xcframework.sh
+scripts/verify-core-bindings.sh
 swift test --jobs 4
 ```
 
@@ -111,3 +123,24 @@ evidence; public-network and physical-device acceptance remain separate.
 
 The session and media protocols remain experimental; the linked RelaySwarm
 NIP draft is a local proposal, not an accepted NIP. MIT.
+
+## Piece transfer and serving
+
+For schema 3, create `CoreMediaPeer` owners for already admitted, reliable,
+ordered channels and pass eligible framing-2 sources to
+`SignedPieceTransfer.receive`. `SwarmGuest.connect(objectFraming: 2, ...)`
+requires a peer advertising `obj: 2`; the ordinary connect default remains
+framing 1. Unknown capability values do not opt into piece ranges.
+
+The host supplies current trust and an explicit authorised origin-range
+closure with cancellation and a network deadline. The Rust core verifies every
+piece and the whole object; Kit rechecks current trust before returning it.
+The returned source counts credit the first verified copy, not network cost.
+The default remains at most three holders and the existing cold rate floor.
+
+Serving requires a host-provided `serve` callback that checks current upload
+consent/allowance and answers only from its authorised cache. There is no
+automatic upload, private-key handling, HTTP endpoint selection or background
+service. Native send-queue levels and drain callbacks pace uploads; no simulated
+empty buffer or polling substitute is used. Close each peer with its connection
+lifecycle. See the [full contract](docs/core-integration.md).

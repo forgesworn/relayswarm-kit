@@ -1,6 +1,7 @@
 # Application-owned signed-media trust
 
-`RelaySwarmMedia` is a receive-only verifier and framing consumer. Applications
+`RelaySwarmMedia` verifies and receives signed media through the published core.
+Piece assembly and serving are explicit host-controlled APIs. Applications
 own author discovery/pinning, endpoint authorisation, playlist interpretation,
 revocation availability, playback, fallback and consent. Private author keys
 are never requested or held by the consumer. A relay peer's presence or ticket
@@ -13,6 +14,7 @@ authorisation ID, swarm, object key, rendition, media sequence,
 discontinuity, optional part, SHA-256, byte size and expiry. Schema 1 retains
 numeric main-video rendition identity. Schema 2 additionally binds the exact
 local playlist path, main/audio media type and optional AES-128 context.
+Schema 3 adds canonical piece size and piece hashes to schema 2.
 Schema 2 never selects a playlist using a remote peer's hint.
 
 The host supplies `MediaContext`, including its maximum object size. The
@@ -80,3 +82,17 @@ correct application-supplied schema 2 context.
 No upload server, native UI/player or global author/delegation directory is
 created by these APIs. Signed bytes and desktop loopback transport evidence
 do not establish physical Apple-platform playback or public NAT traversal.
+
+
+## Shared core
+
+Current source consumes RelaySwarm v0.3.0's released XCFramework by checksum.
+The application's `MediaTrust` still pins trusted authors. The core decides
+commitment/delegation/revocation/context validity; Kit keeps its seconds-to-ms
+adapter, public result types and final byte integrity check.
+
+`SignedMediaTransfer` remains the bounded whole-object receive API, now using
+the core peer-link machine. `SignedPieceTransfer` adds schema-3 assembly with
+explicit eligible peers and an origin-range callback. No managed service is
+required. See [core integration](core-integration.md) for ownership, cancellation,
+back-pressure, serving authority and evidence limits.
