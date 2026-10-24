@@ -112,7 +112,17 @@ final class TransportTests: XCTestCase {
         let guest = SwarmGuest(pool: RelayPool(connections: [RelayConnection(transport: relay.makeTransport())]),
                                swarmID: "watch-test")
         try await host.start(admitPeer: { _, _ in true })
-        let channel = try await guest.connect(timeoutSeconds: 15, admitPeer: { _ in true })
+        // Miss the initial ephemeral announcement deliberately. The watcher
+        // arrives inside its one-second rate window and needs a deferred
+        // response, rather than waiting for the 15-second periodic cadence.
+        let announcedBy = Date().addingTimeInterval(2)
+        while !(await relay.capturedEvents()).contains(where: { $0.kind == SwarmWire.presenceKind }) {
+            guard Date() < announcedBy else { await host.stop(); XCTFail("initial presence missing"); return }
+            try await Task.sleep(for: .milliseconds(1))
+        }
+        let channel: DataChannel
+        do { channel = try await guest.connect(timeoutSeconds: 3, admitPeer: { _ in true }) }
+        catch { await guest.close(); await host.stop(); throw error }
 
         let received = AsyncStream<String> { continuation in
             channel.onText = { continuation.yield($0) }

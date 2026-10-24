@@ -16,6 +16,7 @@ public actor SwarmHost {
     private var channels = [ObjectIdentifier: DataChannel]()
     private var tasks = [Task<Void, Never>]()
     private var lastAnnounce = Date.distantPast
+    private var pendingAnnounce: Task<Void, Never>?
     private let maxPeers = 16
     private var admission: @Sendable (String, String?) -> Bool = { _, _ in false }
     private var guestText: (@Sendable (String) -> Void)?
@@ -66,6 +67,8 @@ public actor SwarmHost {
     }
 
     public func stop() async {
+        pendingAnnounce?.cancel(); pendingAnnounce = nil
+        lastAnnounce = .distantPast
         for task in tasks { task.cancel() }
         tasks.removeAll()
         for channel in channels.values { channel.close() }
@@ -96,9 +99,28 @@ public actor SwarmHost {
         // The rate limit is for the watcher-triggered path: three phones
         // joining together should not mean three announcements.
         guard force || Date().timeIntervalSince(lastAnnounce) > 2 else { return }
-        if force, Date().timeIntervalSince(lastAnnounce) < 1 { return }
+        let elapsed = Date().timeIntervalSince(lastAnnounce)
+        if force, elapsed < 1 {
+            // Ephemeral presence is not replayed. A watcher that missed the
+            // last announcement still needs a reply when this rate window
+            // ends. Coalesce the burst into one bounded pending task.
+            if pendingAnnounce == nil {
+                let delay = max(0, 1 - elapsed)
+                pendingAnnounce = Task { [weak self] in
+                    do { try await Task.sleep(for: .seconds(delay)) } catch { return }
+                    await self?.flushAnnounce()
+                }
+            }
+            return
+        }
         lastAnnounce = Date()
         try? await signaller.announcePresence(role: "seeder", open: peers.count < maxPeers)
+    }
+
+    private func flushAnnounce() async {
+        guard !Task.isCancelled else { return }
+        pendingAnnounce = nil
+        await announceNow()
     }
 
     private func answer(offerSDP: String, viewer: String, requestID: String, admissionTicket: String?) {
