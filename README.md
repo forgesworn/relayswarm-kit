@@ -33,7 +33,7 @@ Intel, physical-device or public-NAT interoperability. Binary source,
 dependency and checksums are recorded in `build/DataChannel.provenance`;
 CI verifies the archive and each object's deployment target. The core binary
 comes from [RelaySwarm v0.3.0](https://github.com/forgesworn/relayswarm/releases/tag/v0.3.0)
-by immutable URL and SwiftPM checksum; its generated wrapper is retained
+by versioned URL and SwiftPM checksum; its generated wrapper is retained
 byte-for-byte with provenance. See [core integration](docs/core-integration.md).
 
 ## Session migration

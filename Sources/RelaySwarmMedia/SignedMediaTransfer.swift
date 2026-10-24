@@ -64,6 +64,7 @@ public enum SignedMediaTransfer {
                         }
                         return nil
                     }
+                    try Task.checkCancellation()
                     let request = link.request(now: mediaLinkClock(), key: context.key, timeoutMs: UInt64(timeoutMilliseconds), expectedSize: UInt64(commitment.size))
                     guard request.requestId != nil else { throw MediaTransferError.unavailable }
                     _ = try process(request)
@@ -82,17 +83,20 @@ public enum SignedMediaTransfer {
                         }
                         if let bytes = try process(update) { return bytes }
                     }
+                    try Task.checkCancellation()
                     throw MediaTransferError.closed
                 }
                 group.addTask {
                     try await Task.sleep(nanoseconds: UInt64(timeoutMilliseconds) * 1_000_000)
-                    channel.close()
+                    // Settle the deadline before closing the stream. Closing
+                    // here lets its EOF race this error and report `closed`.
                     throw MediaTransferError.timedOut
                 }
                 defer { group.cancelAll() }
                 guard let data = try await group.next() else { throw MediaTransferError.closed }
+                try Task.checkCancellation()
                 return data
             }
-        } catch { channel.close(); throw error }
+        } catch { channel.close(); try Task.checkCancellation(); throw error }
     }
 }
